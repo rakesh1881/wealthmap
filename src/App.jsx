@@ -1,12 +1,12 @@
 // ============================================================
-// WEALTHMAP v12 — Undo FD Close, Profits Summary, No Market Prices, Autocomplete, Inv Account Sync
+// WEALTHMAP v12 — UX Overhaul + Account Sync Fix
 // Changes vs v11:
-//  1.  Undo Close FD: closed FD snapshot stored, fully reversible
-//  2.  Profits tab: summary per stock (symbol + total sold + net P&L only)
-//  3.  Market price logic completely removed (no API fetch, no manual price input)
-//  4.  Stock name autocomplete from existing trades (not Google Finance search)
-//  5.  Investment account balance syncs on buy/sell (two-sided effect)
-//  6.  All account balance updates verified for trades/FD/MF
+//  1.  FD Close: Undo support (FD marked closed, not deleted)
+//  2.  Profits tab: summary per stock only (no individual trade rows)
+//  3.  Remove market price API / manual price input / stocks master enforcement
+//  4.  Stock name autocomplete from existing trade history
+//  5.  Trade account sync: BUY credits investment acct, SELL debits it
+//  6.  Account balance verification for all trade/FD actions
 // ============================================================
 
 import { useState, useEffect, useReducer, useRef, useMemo, useCallback } from "react";
@@ -81,7 +81,9 @@ const DEFAULT = {
   // stocks: [{ id, symbol, name, type:"stock"|"mf", exchange }]
   // Trades must reference a stock from this table (by symbol).
   stocks:              [],
-  // marketPrices kept for legacy data migration but no longer updated
+  // ── NEW in v7 ──────────────────────────────────────────────────────────────
+  // marketPrices: { [symbol]: { current_price, last_updated } }
+  // Used for current value of holdings; separate from trade prices.
   marketPrices:        {},
   // corporateActions: array of { id, symbol, action_type, ratio, date, note }
   // Supported: stock_split, bonus, reverse_split, dividend, stock_name_change
@@ -89,9 +91,6 @@ const DEFAULT = {
   // tradeBalanceEffects: synthetic ledger entries for buy/sell balance changes
   // { id, accountId, amount, sign: 1|-1, tradeId, date }
   tradeBalanceEffects: [],
-  // closedFDs: snapshots of closed FDs, used for Undo Close FD feature
-  // { snapshotId, fd, incTxId, closeEffectId, closedAt }
-  closedFDs:           [],
   fxRates: { USD:83.5, EUR:91.2, GBP:106.5, JPY:0.56, SGD:62.1, AED:22.7, HKD:10.7, CHF:94.3, AUD:54.8 },
 };
 
@@ -139,7 +138,6 @@ function sanitize(raw) {
     corporateActions:    Array.isArray(raw.corporateActions)     ? raw.corporateActions    : [],
     tradeBalanceEffects: Array.isArray(raw.tradeBalanceEffects)  ? raw.tradeBalanceEffects : [],
     stocks:              Array.isArray(raw.stocks)               ? raw.stocks              : [],
-    closedFDs:           Array.isArray(raw.closedFDs)            ? raw.closedFDs           : [],
   };
 }
 
@@ -308,7 +306,7 @@ function calcBalance(accountId, transactions, accounts, tradeBalanceEffects) {
 // @param fixedDeposits      - FD array
 // @param marketPrices       - { [symbol]: { current_price } }
 // @param tradeBalanceEffects - trade balance deduction/credit effects
-function calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, {}, tradeBalanceEffects) {
+function calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, marketPrices, tradeBalanceEffects) {
   let assets   = 0;
   let ccPayable = 0;
   const mp = marketPrices || {};
@@ -333,16 +331,15 @@ function calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, 
     }
   });
 
-  // Add investment holdings value (use invested amount — market prices removed in v12)
+  // Add investment holdings value (trade prices only — no market price)
   (holdings||[]).forEach(h => {
-    const qty = h.quantity || h.units || 0;
+    const qty   = h.quantity || h.units || 0;
     const value = h.investedAmount || qty * (h.avgPrice || h.nav || 0);
     assets += toINR(value, h.currency||"INR", fxRates);
   });
 
-  // Add fixed deposits at invested amount only (not maturity value)
-  // Interest is added manually by user as income when FD matures.
-  (fixedDeposits||[]).forEach(fd => {
+  // Add active (non-closed) fixed deposits at invested amount
+  (fixedDeposits||[]).filter(fd => fd.status !== "closed").forEach(fd => {
     const principal = parseFloat(fd.amount)||0;
     assets += toINR(principal, fd.currency||"INR", fxRates);
   });
@@ -499,6 +496,142 @@ function buildRealizedTrades(investmentTx) {
 //
 // CORS proxy waterfall (tested to work from localhost AND production):
 //   1. allorigins.win  — most reliable, supports all origins
+//   2. corsproxy.io    — good fallback
+//   Timeout: 8s per proxy attempt
+//
+function toGoogleSymbol(raw) {
+  if (!raw) return null;
+  const s = raw.trim();
+  // Already Google format with colon
+  if (s.includes(":")) return s;
+  // Yahoo-style suffix
+  if (s.endsWith(".NS")) return "NSE:" + s.slice(0, -3);
+  if (s.endsWith(".BO")) return "BSE:" + s.slice(0, -3);
+  // Bare symbol — assume NSE
+  return "NSE:" + s;
+}
+
+function toYahooSymbol(raw) {
+  if (!raw) return null;
+  const s = raw.trim();
+  if (/\.[A-Z]{1,3}$/.test(s)) return s;
+  const colonIdx = s.indexOf(":");
+  if (colonIdx > 0) {
+    const exchange = s.slice(0, colonIdx).toUpperCase();
+    const ticker   = s.slice(colonIdx + 1);
+    if (exchange === "MUTF_IN") return ticker + ".BO";
+    if (exchange === "NSE")     return ticker + ".NS";
+    if (exchange === "BSE")     return ticker + ".BO";
+    return ticker + ".NS";
+  }
+  return s + ".NS";
+}
+
+// Parse price from Google Finance HTML
+function parseGoogleFinancePrice(html) {
+  if (!html) return null;
+  // Google Finance embeds price in multiple formats; try each
+  const patterns = [
+    // JSON-LD / data attribute: "price":"450.25"
+    /"price"\s*:\s*"?([\d,]+\.?\d*)"/,
+    // The main price display div uses data-last-price
+    /data-last-price="([\d.]+)"/,
+    // Structured data price pattern
+    /"regularMarketPrice"\s*:\s*([\d.]+)/,
+    // Price in the page title or meta
+    /content="[\w\s]+\s+([\d,]+\.?\d*)\s*(?:INR|₹)/,
+    // YFinance-style embedded JSON
+    /"currentPrice"\s*:\s*([\d.]+)/,
+  ];
+  for (const re of patterns) {
+    const m = html.match(re);
+    if (m) {
+      const val = parseFloat(m[1].replace(/,/g, ""));
+      if (val > 0) return val;
+    }
+  }
+  return null;
+}
+
+async function _fetchViaProxy(url) {
+  // Proxy 1: allorigins.win — wraps response in {contents:"..."}
+  const proxies = [
+    async (u) => {
+      const r = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(u)}`, {
+        signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
+      });
+      if (!r.ok) throw new Error("allorigins failed");
+      const j = await r.json();
+      return j.contents || "";
+    },
+    async (u) => {
+      const r = await fetch(`https://corsproxy.io/?${encodeURIComponent(u)}`, {
+        signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
+      });
+      if (!r.ok) throw new Error("corsproxy failed");
+      return await r.text();
+    },
+  ];
+  for (const proxy of proxies) {
+    try {
+      const text = await proxy(url);
+      if (text && text.length > 100) return text;
+    } catch {}
+  }
+  return null;
+}
+
+// Fetch price from Google Finance for one symbol
+async function _fetchGooglePrice(googleSym) {
+  const url = `https://www.google.com/finance/quote/${encodeURIComponent(googleSym)}`;
+  const html = await _fetchViaProxy(url);
+  if (!html) return null;
+  return parseGoogleFinancePrice(html);
+}
+
+// Fetch price from Yahoo Finance (more reliable numeric data)
+async function _fetchYahooPrice(yahooSym) {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=1d&range=1d`;
+  const raw = await _fetchViaProxy(url);
+  if (!raw) return null;
+  try {
+    const data = JSON.parse(raw);
+    const price = data?.chart?.result?.[0]?.meta?.regularMarketPrice;
+    return price && price > 0 ? parseFloat(price.toFixed(2)) : null;
+  } catch { return null; }
+}
+
+async function fetchLivePrice(symbol) {
+  if (!symbol) return null;
+  // Try Yahoo Finance first (clean JSON, easy to parse)
+  try {
+    const yahooSym = toYahooSymbol(symbol);
+    const yPrice = await _fetchYahooPrice(yahooSym);
+    if (yPrice && yPrice > 0) return yPrice;
+  } catch {}
+  // Fall back to Google Finance HTML scraping
+  try {
+    const gSym = toGoogleSymbol(symbol);
+    const gPrice = await _fetchGooglePrice(gSym);
+    if (gPrice && gPrice > 0) return gPrice;
+  } catch {}
+  return null;
+}
+
+// Fetch prices for multiple symbols sequentially
+async function fetchMultiplePrices(symbols) {
+  if (!symbols || symbols.length === 0) return {};
+  const result = {};
+  for (let i = 0; i < symbols.length; i++) {
+    try {
+      const price = await fetchLivePrice(symbols[i]);
+      if (price && price > 0) result[symbols[i]] = price;
+    } catch {}
+    if (i < symbols.length - 1) await new Promise(r => setTimeout(r, 400));
+  }
+  return result;
+}
+
 // ─── FD INTEREST CALCULATOR ──────────────────────────────────────────────────
 function calcFDReturns(fd) {
   const principal = parseFloat(fd.amount)||0;
@@ -513,38 +646,36 @@ function calcFDReturns(fd) {
 // ─── BUILD TRADE BALANCE EFFECTS ──────────────────────────────────────────────
 // Derives tradeBalanceEffects from full investmentTx array.
 // Called when rebuilding from scratch (edit/delete trade).
-// BUY source account: sign = -1 (deduct from bank/wallet)
-// BUY inv account:    sign = +1 (credit to broker account)
-// SELL source account: sign = +1 (credit back to bank/wallet)
-// SELL inv account:    sign = -1 (deduct from broker account)
+// BUY: sign = -1 (deduct from source)
+// SELL: sign = +1 (credit to source)
 function buildTradeBalanceEffects(investmentTx, fixedDeposits) {
+  // For each trade: TWO effects — source account and investment account
   const stockEffects = [];
   (investmentTx||[])
     .filter(itx => !itx.invType?.includes("fd"))
     .forEach(itx => {
       const amt = (parseFloat(itx.quantity)||0) * (parseFloat(itx.price)||0);
       if (amt <= 0) return;
-      // Source account (bank/wallet)
+      // Source/bank account: BUY deducts, SELL credits
       if (itx.sourceAccountId) {
         stockEffects.push({
-          id:        "src_eff_" + itx.id,
+          id:        "eff_src_" + itx.id,
           accountId: itx.sourceAccountId,
           amount:    amt,
-          sign:      itx.type === "buy" ? -1 : +1,
-          tradeId:   itx.id,
+          sign:      itx.type === "buy" ? -1 : 1,
+          tradeId:   itx.id + "_src",
           date:      itx.date,
         });
       }
-      // Investment account (broker) — opposite sign to source
-      if (itx.accountId && itx.accountId !== itx.sourceAccountId) {
+      // Investment account: BUY credits, SELL debits
+      if (itx.accountId) {
         stockEffects.push({
-          id:           "inv_eff_" + itx.id,
-          accountId:    itx.accountId,
-          amount:       amt,
-          sign:         itx.type === "buy" ? +1 : -1,
-          tradeId:      itx.id + "_inv",
-          date:         itx.date,
-          isInvAccount: true,
+          id:        "eff_inv_" + itx.id,
+          accountId: itx.accountId,
+          amount:    amt,
+          sign:      itx.type === "buy" ? 1 : -1,
+          tradeId:   itx.id + "_inv",
+          date:      itx.date,
         });
       }
     });
@@ -758,36 +889,36 @@ function reducer(rawState, action) {
 
     // ── Investments (full FIFO-aware) ─────────────────────────────────────────
     // ADD_INVESTMENT: { newHolding, itx }
-    // BUY:  deducts trade value from sourceAccountId, credits investmentAccountId (accountId)
-    // SELL: deducts from investmentAccountId, credits sourceAccountId
+    // BUY:  deducts trade value from sourceAccountId via tradeBalanceEffect
+    // SELL: credits trade value to sourceAccountId via tradeBalanceEffect
     // Holdings are updated incrementally here (not rebuilt from scratch).
     case "ADD_INVESTMENT": {
       const { newHolding, itx } = action.payload;
       const tradeAmt = (parseFloat(itx.quantity)||0) * (parseFloat(itx.price)||0);
 
+      // Trade balance effects:
+      // BUY:  source account (bank) -tradeAmt, investment account +tradeAmt
+      // SELL: investment account -tradeAmt, source account (bank) +tradeAmt
       const tradeEffects = [...s.tradeBalanceEffects];
       if (tradeAmt > 0) {
-        // Source account effect (bank/wallet): BUY deducts, SELL credits
         if (itx.sourceAccountId) {
           tradeEffects.push({
-            id:        "src_" + itx.id,
+            id:        uid(),
             accountId: itx.sourceAccountId,
             amount:    tradeAmt,
-            sign:      itx.type === "buy" ? -1 : +1,
-            tradeId:   itx.id,
+            sign:      itx.type === "buy" ? -1 : 1,
+            tradeId:   itx.id + "_src",
             date:      itx.date,
           });
         }
-        // Investment account effect (broker): BUY credits, SELL deducts
-        if (itx.accountId && itx.accountId !== itx.sourceAccountId) {
+        if (itx.accountId) {
           tradeEffects.push({
-            id:        "inv_" + itx.id,
+            id:        uid(),
             accountId: itx.accountId,
             amount:    tradeAmt,
-            sign:      itx.type === "buy" ? +1 : -1,
+            sign:      itx.type === "buy" ? 1 : -1,
             tradeId:   itx.id + "_inv",
             date:      itx.date,
-            isInvAccount: true,
           });
         }
       }
@@ -943,8 +1074,8 @@ function reducer(rawState, action) {
       const effs = s.tradeBalanceEffects.filter(e => e.tradeId !== fdId);
       return { ...s, fixedDeposits: (s.fixedDeposits||[]).filter(f => f.id !== fdId), tradeBalanceEffects: effs };
     }
-    // CLOSE_FD: credit principal + interest to selected account
-    // Stores snapshot in closedFDs for undo capability
+    // CLOSE_FD: credit principal to selected account + record interest as income tx
+    // FD is kept with status=closed for undo support (not deleted)
     case "CLOSE_FD": {
       const { fdId, incomeAccId, interestAmt, closeDate } = action.payload;
       const fd = (s.fixedDeposits||[]).find(f => f.id === fdId);
@@ -954,17 +1085,16 @@ function reducer(rawState, action) {
       const principal   = parseFloat(fd.amount) || 0;
       const interest    = parseFloat(interestAmt) || 0;
 
-      // IDs for reverse tracking (needed by undo)
-      const closeEffectId = "fdclose_" + fdId;
-      const incTxId       = uid();
+      const closeEffId  = "fdclose_" + fdId;
+      const incTxId     = "fdint_" + fdId;
 
-      // Remove the original deduction effect, add credit for principal
-      let effs = s.tradeBalanceEffects.filter(e => e.tradeId !== fdId);
+      // Remove original deduction effect; add principal-return credit
+      let effs = s.tradeBalanceEffects.filter(e => e.tradeId !== fdId && e.id !== closeEffId);
       if (targetAccId && principal > 0) {
         effs.push({
-          id:        closeEffectId,
+          id:        closeEffId,
           accountId: targetAccId,
-          amount:    principal,     // principal returned to account
+          amount:    principal,
           sign:      +1,
           tradeId:   fdId + "_close",
           date:      closeDate,
@@ -972,7 +1102,7 @@ function reducer(rawState, action) {
         });
       }
 
-      // Interest recorded as income transaction
+      // Interest as income transaction
       const incTx = interest > 0 ? {
         id:         incTxId,
         type:       "income",
@@ -980,64 +1110,63 @@ function reducer(rawState, action) {
         accountId:  targetAccId,
         categoryId: "ic_int",
         date:       closeDate,
-        note:       `FD interest: ${fd.name || "Fixed Deposit"}`,
+        note:       "FD interest: " + (fd.name || "Fixed Deposit"),
         currency:   fd.currency || "INR",
-        _fdClose:   true,  // marker for undo lookup
+        fdId:       fdId,
       } : null;
 
-      // Snapshot for undo
-      const snapshot = {
-        snapshotId:    uid(),
-        fd:            { ...fd },         // full FD object as it was
-        incTxId:       incTx ? incTxId : null,
-        closeEffectId,
-        targetAccId,
-        principal,
-        interest,
+      // Mark FD as closed (keep it for undo); store close metadata
+      const closedFd = {
+        ...fd,
+        status:         "closed",
         closeDate,
-        closedAt:      new Date().toISOString(),
+        closedAccId:    targetAccId,
+        closedInterest: interest,
+        closeEffId,
+        incTxId:        incTx ? incTxId : null,
       };
 
       return {
         ...s,
-        fixedDeposits:       (s.fixedDeposits||[]).filter(f => f.id !== fdId),
+        fixedDeposits:       (s.fixedDeposits||[]).map(f => f.id === fdId ? closedFd : f),
         tradeBalanceEffects: effs,
         transactions:        incTx ? [...s.transactions, incTx] : s.transactions,
-        closedFDs:           [...(s.closedFDs||[]), snapshot],
       };
     }
 
-    // UNDO_CLOSE_FD: reverse a closed FD using its snapshot
+    // UNDO_CLOSE_FD: reverses a closed FD back to active
     case "UNDO_CLOSE_FD": {
-      const snapshotId = action.payload;
-      const snap = (s.closedFDs||[]).find(c => c.snapshotId === snapshotId);
-      if (!snap) return s;
+      const fdId = action.payload;
+      const fd   = (s.fixedDeposits||[]).find(f => f.id === fdId);
+      if (!fd || fd.status !== "closed") return s;
 
-      // Restore original FD deduction effect
-      const restoredEffect = snap.fd.sourceAccountId && snap.fd.amount > 0 ? {
-        id:        "fdeff_" + snap.fd.id,
-        accountId: snap.fd.sourceAccountId,
-        amount:    parseFloat(snap.fd.amount),
-        sign:      -1,
-        tradeId:   snap.fd.id,
-        date:      snap.fd.investedDate || "",
-        isFD:      true,
-      } : null;
+      // Remove the close credit; restore original deduction
+      let effs = s.tradeBalanceEffects.filter(e => e.id !== fd.closeEffId);
+      if (fd.sourceAccountId && parseFloat(fd.amount) > 0) {
+        effs.push({
+          id:        "fdeff_" + fdId,
+          accountId: fd.sourceAccountId,
+          amount:    parseFloat(fd.amount),
+          sign:      -1,
+          tradeId:   fdId,
+          date:      fd.investedDate || "",
+          isFD:      true,
+        });
+      }
 
-      // Remove the close effect, restore deduction, remove income tx
-      let effs = s.tradeBalanceEffects.filter(e => e.id !== snap.closeEffectId);
-      if (restoredEffect) effs.push(restoredEffect);
-
-      const txs = snap.incTxId
-        ? s.transactions.filter(t => t.id !== snap.incTxId)
+      // Remove the income transaction that was created for interest
+      const newTxs = fd.incTxId
+        ? s.transactions.filter(t => t.id !== fd.incTxId)
         : s.transactions;
+
+      // Restore FD to active status — strip close metadata
+      const { status, closeDate, closedAccId, closedInterest, closeEffId, incTxId, ...restoredFd } = fd;
 
       return {
         ...s,
-        fixedDeposits:       [...(s.fixedDeposits||[]), snap.fd],
+        fixedDeposits:       (s.fixedDeposits||[]).map(f => f.id === fdId ? restoredFd : f),
         tradeBalanceEffects: effs,
-        transactions:        txs,
-        closedFDs:           (s.closedFDs||[]).filter(c => c.snapshotId !== snapshotId),
+        transactions:        newTxs,
       };
     }
 
@@ -2089,7 +2218,7 @@ function NetWorthBreakdownModal({ state, onClose }) {
   const tradeBalanceEffects = state?.tradeBalanceEffects ||[];
   const accountCategories   = state?.accountCategories   ||DEFAULT.accountCategories;
 
-  const netWorth = calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, {}, tradeBalanceEffects);
+  const netWorth = calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, marketPrices, tradeBalanceEffects);
 
   // Bank accounts
   const bankCatIds = accountCategories.filter(c=>c.name==="Bank"||c.id==="cat_bank").map(c=>c.id);
@@ -2104,15 +2233,17 @@ function NetWorthBreakdownModal({ state, onClose }) {
   // Stocks
   const stocks = holdings.filter(h=>h.type==="stock");
   const stockTotal = stocks.reduce((s,h)=>{
+    const mp=marketPrices[h.symbol]?.current_price;
     const qty=h.quantity||0;
-    return s+toINR(h.investedAmount||qty*(h.avgPrice||0),h.currency||"INR",fxRates);
+    return s+toINR(mp?mp*qty:(h.investedAmount||qty*(h.avgPrice||0)),h.currency||"INR",fxRates);
   },0);
 
   // Mutual Funds
   const mfs = holdings.filter(h=>h.type==="mf");
   const mfTotal = mfs.reduce((s,h)=>{
+    const mp=marketPrices[h.symbol]?.current_price;
     const qty=h.units||0;
-    return s+toINR(h.investedAmount||qty*(h.nav||0),h.currency||"INR",fxRates);
+    return s+toINR(mp?mp*qty:(h.investedAmount||qty*(h.nav||0)),h.currency||"INR",fxRates);
   },0);
 
   // Fixed Deposits — show invested amount only
@@ -2177,13 +2308,14 @@ function DashboardView({ state }) {
   const monthNetOut   = monthGrossOut - monthRefunded;
 
   // ── Centralized net worth — single source of truth ──────────────────────
-  const netWorth = calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, {}, tradeBalanceEffects);
+  const netWorth = calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, marketPrices, tradeBalanceEffects);
   const recentTx = [...transactions].sort((a,b)=>new Date(b.date)-new Date(a.date)).slice(0,5);
 
-  // Portfolio value at cost basis (no market price)
+  // Portfolio value at market price if available
   const portfolio = holdings.reduce((s,h)=>{
+    const mp=marketPrices[h.symbol]?.current_price;
     const qty=h.quantity||h.units||0;
-    return s+toINR(h.investedAmount||qty*(h.avgPrice||h.nav||0),h.currency,fxRates);
+    return s+toINR(mp?mp*qty:(h.investedAmount||qty*(h.avgPrice||h.nav||0)),h.currency,fxRates);
   },0);
 
   const cbSummary = calcCashbackSummary(transactions, accounts);
@@ -2322,7 +2454,7 @@ function AccountsView({ state, dispatch }) {
     toast("Account deleted");
   }
 
-  const netWorth = calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, {}, tradeBalanceEffects);
+  const netWorth = calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, marketPrices, tradeBalanceEffects);
 
   return (
     <div>
@@ -2473,16 +2605,56 @@ function TransactionsView({ state, dispatch }) {
 // ─── SYMBOL SEARCH via Yahoo Finance autocomplete ────────────────────────────
 // Uses Yahoo Finance's autocomplete endpoint via allorigins proxy.
 // Works from localhost and production alike.
+async function searchGoogleFinance(query) {
+  if (!query || query.length < 1) return [];
+  try {
+    const yUrl = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(query)}&quotesCount=10&newsCount=0&listsCount=0`;
+    const raw = await _fetchViaProxy(yUrl);
+    if (!raw) return [];
+    let data;
+    try { data = JSON.parse(raw); } catch { return []; }
+    return (data?.quotes || [])
+      .filter(q => q.symbol && (q.exchange || q.exchDisp))
+      .map(q => ({
+        symbol:   q.symbol,
+        name:     q.longname || q.shortname || q.symbol,
+        exchange: q.exchDisp || q.exchange || "",
+        type:     (q.quoteType || "").toLowerCase().includes("fund") ||
+                  (q.quoteType || "").toLowerCase().includes("etf")  ? "mf" : "stock",
+      }));
+  } catch { return []; }
+}
+
 // ─── STOCKS MASTER MODAL ─────────────────────────────────────────────────────
-// Manages the Stocks Master Table. Allows manual add, edit name, delete.
+// Manages the Stocks Master Table. Shows all stocks, allows search-add, edit name, delete.
 function StocksMasterModal({ state, dispatch, onClose }) {
   const stocks = state?.stocks || [];
   const [search, setSearch] = useState("");
   const [query,  setQuery]  = useState("");
+  const [suggestions, setSuggestions] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [searchFailed, setSearchFailed] = useState(false);
   const [manualName, setManualName] = useState("");
   const [manualType, setManualType] = useState("stock");
   const [editStock, setEditStock] = useState(null);
   const [editName,  setEditName]  = useState("");
+
+  const searchTimer = useRef(null);
+
+  function onQueryChange(val) {
+    setQuery(val);
+    setSearchFailed(false);
+    setSuggestions([]);
+    clearTimeout(searchTimer.current);
+    if (val.length < 1) return;
+    searchTimer.current = setTimeout(async () => {
+      setSearching(true);
+      const results = await searchGoogleFinance(val);
+      setSuggestions(results);
+      setSearching(false);
+      if (results.length === 0) setSearchFailed(true);
+    }, 400);
+  }
 
   function addManualStock() {
     const sym = query.trim().toUpperCase();
@@ -2491,7 +2663,14 @@ function StocksMasterModal({ state, dispatch, onClose }) {
     if (stocks.find(st => st.symbol === sym)) { toast(`${sym} already in master`, "error"); return; }
     dispatch({ type:"ADD_STOCK", payload:{ id:uid(), symbol:sym, name:nm, type:manualType, exchange:"" } });
     toast(`${sym} added to Stocks Master`);
-    setQuery(""); setManualName("");
+    setQuery(""); setManualName(""); setSuggestions([]); setSearchFailed(false);
+  }
+
+  function addStock(s) {
+    if (stocks.find(st => st.symbol === s.symbol)) { toast(`${s.symbol} already in master`, "error"); return; }
+    dispatch({ type:"ADD_STOCK", payload:{ id:uid(), symbol:s.symbol, name:s.name, type:s.type||"stock", exchange:s.exchange } });
+    toast(`${s.symbol} added to Stocks Master`);
+    setQuery(""); setSuggestions([]);
   }
 
   function deleteStock(st) {
@@ -2521,34 +2700,56 @@ function StocksMasterModal({ state, dispatch, onClose }) {
   return (
     <Modal title="📚 Stocks Master" onClose={onClose}>
       {/* Search to add new */}
-      <div style={{marginBottom:16}}>
-        <div style={{fontSize:12,fontWeight:700,color:"#475569",marginBottom:8,textTransform:"uppercase",letterSpacing:"0.05em"}}>Add New Stock / Fund</div>
-        <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"flex-end"}}>
-          <div style={{flex:"1 1 120px"}}>
-            <div style={{fontSize:11,color:"#94A3B8",marginBottom:3}}>Symbol</div>
-            <input value={query} onChange={e=>setQuery(e.target.value.toUpperCase())} placeholder="e.g. TCS"
-              style={{...inputStyle,padding:"7px 10px",fontSize:13}}
-              onFocus={e=>e.target.style.borderColor="#6366F1"} onBlur={e=>e.target.style.borderColor="#E2E8F0"} />
+      <div style={{position:"relative",marginBottom:16}}>
+        <label style={{display:"block",fontSize:12,fontWeight:600,color:"#64748B",marginBottom:6,textTransform:"uppercase",letterSpacing:"0.05em"}}>Search &amp; Add Symbol</label>
+        <input value={query} onChange={e=>onQueryChange(e.target.value)}
+          placeholder="Type NSE:ITBEES, TCS, ICICI…"
+          style={{...inputStyle,paddingRight:40}}
+          onFocus={e=>e.target.style.borderColor="#6366F1"}
+          onBlur={e=>e.target.style.borderColor="#E2E8F0"} />
+        {searching && <div style={{position:"absolute",right:12,top:38,fontSize:12,color:"#94A3B8"}}>🔍…</div>}
+        {suggestions.length>0 && (
+          <div style={{position:"absolute",left:0,right:0,top:"100%",background:"#fff",border:"1.5px solid #E2E8F0",borderRadius:10,zIndex:500,boxShadow:"0 8px 24px rgba(0,0,0,0.12)",maxHeight:240,overflowY:"auto"}}>
+            {suggestions.map((s,i)=>(
+              <button key={i} onClick={()=>addStock(s)}
+                style={{display:"block",width:"100%",textAlign:"left",padding:"10px 14px",border:"none",background:"none",cursor:"pointer",borderBottom:i<suggestions.length-1?"1px solid #F1F5F9":"none",fontFamily:"inherit"}}>
+                <div style={{fontWeight:700,fontSize:13,color:"#0F172A"}}>{s.exchange?`${s.exchange}:${s.symbol}`:s.symbol}</div>
+                <div style={{fontSize:11,color:"#64748B"}}>{s.name} · {s.type==="mf"?"Mutual Fund":"Stock"}</div>
+              </button>
+            ))}
           </div>
-          <div style={{flex:"2 1 180px"}}>
-            <div style={{fontSize:11,color:"#94A3B8",marginBottom:3}}>Name</div>
-            <input value={manualName} onChange={e=>setManualName(e.target.value)} placeholder="e.g. Tata Consultancy Services"
-              style={{...inputStyle,padding:"7px 10px",fontSize:13}}
-              onFocus={e=>e.target.style.borderColor="#6366F1"} onBlur={e=>e.target.style.borderColor="#E2E8F0"} />
-          </div>
-          <div style={{flex:"1 1 90px"}}>
-            <div style={{fontSize:11,color:"#94A3B8",marginBottom:3}}>Type</div>
-            <select value={manualType} onChange={e=>setManualType(e.target.value)} style={{...inputStyle,padding:"7px 10px",fontSize:13}}>
-              <option value="stock">Stock</option>
-              <option value="mf">Mutual Fund</option>
-            </select>
-          </div>
-          <button onClick={addManualStock}
-            style={{alignSelf:"flex-end",padding:"7px 14px",borderRadius:8,border:"none",background:"#6366F1",color:"#fff",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit",flexShrink:0}}>
-            + Add
-          </button>
-        </div>
+        )}
       </div>
+      {/* Manual add fallback when search returns nothing */}
+      {searchFailed && query.length>=2 && (
+        <div style={{background:"#F8FAFC",border:"1.5px solid #E2E8F0",borderRadius:10,padding:12,marginBottom:12}}>
+          <div style={{fontSize:12,color:"#64748B",marginBottom:8}}>⚠️ Online search unavailable — add manually:</div>
+          <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+            <div style={{flex:"1 1 140px"}}>
+              <div style={{fontSize:11,color:"#94A3B8",marginBottom:3}}>Symbol (from search box)</div>
+              <div style={{fontWeight:700,fontSize:13,color:"#0F172A",padding:"6px 10px",background:"#EEF2FF",borderRadius:7}}>{query.toUpperCase()}</div>
+            </div>
+            <div style={{flex:"2 1 180px"}}>
+              <div style={{fontSize:11,color:"#94A3B8",marginBottom:3}}>Name</div>
+              <input value={manualName} onChange={e=>setManualName(e.target.value)} placeholder="e.g. Tata Consultancy Services"
+                style={{...inputStyle,padding:"6px 10px",fontSize:13}}
+                onFocus={e=>e.target.style.borderColor="#6366F1"} onBlur={e=>e.target.style.borderColor="#E2E8F0"} />
+            </div>
+            <div style={{flex:"1 1 100px"}}>
+              <div style={{fontSize:11,color:"#94A3B8",marginBottom:3}}>Type</div>
+              <select value={manualType} onChange={e=>setManualType(e.target.value)}
+                style={{...inputStyle,padding:"6px 10px",fontSize:13}}>
+                <option value="stock">Stock</option>
+                <option value="mf">Mutual Fund</option>
+              </select>
+            </div>
+            <button onClick={addManualStock}
+              style={{alignSelf:"flex-end",padding:"7px 14px",borderRadius:8,border:"none",background:"#6366F1",color:"#fff",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit",flexShrink:0}}>
+              + Add
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Filter existing */}
       <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍 Filter master list…"
@@ -2560,7 +2761,7 @@ function StocksMasterModal({ state, dispatch, onClose }) {
         <div style={{textAlign:"center",padding:32,color:"#94A3B8"}}>
           <div style={{fontSize:36}}>📚</div>
           <div style={{marginTop:8}}>No stocks in master yet</div>
-          <div style={{fontSize:12,marginTop:4}}>Use the form above to add stocks or funds</div>
+          <div style={{fontSize:12,marginTop:4}}>Search above to add stocks (or add manually if offline)</div>
         </div>
       ) : (
         <div style={{display:"flex",flexDirection:"column",gap:0}}>
@@ -2603,8 +2804,8 @@ function StocksMasterModal({ state, dispatch, onClose }) {
 }
 
 // ─── INVESTMENT MODAL (Trade Entry) ──────────────────────────────────────────
-// Features: stock/MF/FD, money-source account, symbol autocomplete from existing trades,
-//           NAV label for MF, edit mode
+// Features: stock/MF/FD, money-source account, symbol search via Google Finance,
+//           stocks master enforcement, NAV label for MF, edit mode
 function InvestModal({ state, onClose, onSave, editTx }) {
   const isEdit   = !!editTx;
   const allAccs  = (state?.accounts||[]).filter(a=>!a.disabled);
@@ -2626,12 +2827,16 @@ function InvestModal({ state, onClose, onSave, editTx }) {
   const [srcAccId,setSrcAccId]= useState(editTx?.sourceAccountId || sourceAccs[0]?.id||"");
   const [brok,    setBrok]    = useState(editTx ? String(editTx.brokerage||0) : "0");
   const [note,    setNote]    = useState(editTx?.note        || "");
-  const [showSugg, setShowSugg] = useState(false);
+  const [fetching,setFetching]= useState(false);
+  const [priceHint,setPriceHint]=useState("");
+  const [symQuery,  setSymQuery]    = useState(editTx?.symbol||"");
+  const [symSugg,   setSymSugg]     = useState([]);
+  const [showSugg, setShowSugg]     = useState(false);
 
-  const [fdAmount,   setFdAmount]    = useState(editTx?.fdAmount||(editTx?.invType==="fd"?String(editTx?.amount||""):""));
+  const [fdAmount,   setFdAmount]    = useState(editTx?.fdAmount||"");
   const [fdInvDate,  setFdInvDate]   = useState(editTx?.investedDate||date);
   const [fdMatDate,  setFdMatDate]   = useState(editTx?.maturityDate||"");
-  const [fdRate,     setFdRate]      = useState(editTx?.interestRate?String(editTx.interestRate):"");
+  const [fdRate,     setFdRate]      = useState(editTx?.interestRate||"");
 
   const isFD  = invType==="fd";
   const isMF  = invType==="mf";
@@ -2640,39 +2845,41 @@ function InvestModal({ state, onClose, onSave, editTx }) {
   const existingHolding = (state?.holdings||[]).find(h=>
     h.symbol===symbol && h.accountId===invAccId && h.type===invType);
 
-  // Build autocomplete list from existing trades + stocks master
+  // Build unique stock names from existing trades for autocomplete
   const existingStocks = useMemo(() => {
-    const seen = new Map();
-    (state?.investmentTx||[]).forEach(t => {
-      if (t.symbol && !seen.has(t.symbol))
-        seen.set(t.symbol, { symbol: t.symbol, name: t.name || t.symbol });
+    const seen = {};
+    (state?.investmentTx||[]).forEach(t=>{
+      if(t.symbol && !seen[t.symbol]) seen[t.symbol] = t.name||t.symbol;
     });
-    (state?.stocks||[]).forEach(st => {
-      if (!seen.has(st.symbol))
-        seen.set(st.symbol, { symbol: st.symbol, name: st.name || st.symbol });
+    (state?.holdings||[]).forEach(h=>{
+      if(h.symbol && !seen[h.symbol]) seen[h.symbol] = h.name||h.symbol;
     });
-    return [...seen.values()];
-  }, [state?.investmentTx, state?.stocks]);
+    return Object.entries(seen).map(([symbol,name])=>({symbol,name}));
+  }, [state?.investmentTx, state?.holdings]);
 
-  const suggestions = symbol.length > 0
-    ? existingStocks.filter(s =>
-        s.symbol.toLowerCase().includes(symbol.toLowerCase()) ||
-        s.name.toLowerCase().includes(symbol.toLowerCase())
-      )
-    : [];
-
-  function onSymbolChange(val) {
-    const upper = val.toUpperCase();
-    setSymbol(upper);
-    const match = existingStocks.find(s => s.symbol === upper);
-    if (match && !name) setName(match.name);
-    setShowSugg(true);
+  function onSymQueryChange(val) {
+    setSymQuery(val);
+    setSymbol(val.toUpperCase());
+    if (val.length < 1) { setSymSugg([]); setShowSugg(false); return; }
+    // Autocomplete from existing trades
+    const lower = val.toLowerCase();
+    const matches = existingStocks.filter(st=>
+      st.symbol.toLowerCase().includes(lower) ||
+      st.name.toLowerCase().includes(lower)
+    );
+    setSymSugg(matches);
+    setShowSugg(matches.length > 0);
   }
 
-  function selectSuggestion(s) {
-    setSymbol(s.symbol);
-    setName(s.name || s.symbol);
-    setShowSugg(false);
+  function selectSymbol(s) {
+    const sym = (s.symbol||"").toUpperCase();
+    setSymbol(sym); setSymQuery(sym);
+    if (s.name) setName(s.name);
+    setShowSugg(false); setSymSugg([]);
+  }
+
+  function lookupPrice() {
+    setPriceHint("Live price unavailable — enter price manually");
   }
 
   function save() {
@@ -2688,23 +2895,21 @@ function InvestModal({ state, onClose, onSave, editTx }) {
       onSave({fd,isFD:true}); toast(isEdit?"FD updated":"FD added"); onClose(); return;
     }
     if (!symbol||!qty||!price) { toast("Fill symbol, qty, price","error"); return; }
+    // No stocks master enforcement — any symbol is allowed
     const q=parseFloat(qty), p=parseFloat(price), b=parseFloat(brok)||0;
-    const masterSt = masterStocks.find(st=>st.symbol===symbol);
     const holdingId = existingHolding?.id || editTx?.holdingId || uid();
     const itx = {
       id:editTx?.id||uid(), holdingId, type:txType,
-      invType:masterSt?.type||invType, symbol, name:name||masterSt?.name||symbol,
+      invType, symbol, name:name||symbol,
       quantity:q, price:p, currency:cur, date, accountId:invAccId,
       sourceAccountId:srcAccId, brokerage:b, note,
     };
     const newHolding = (!existingHolding && txType==="buy") ? {
-      id:holdingId, symbol, name:name||masterSt?.name||symbol,
-      type:masterSt?.type||invType, accountId:invAccId, currency:cur,
+      id:holdingId, symbol, name:name||symbol,
+      type:invType, accountId:invAccId, currency:cur,
       lots:[], quantity:0, units:0, avgPrice:0, investedAmount:0,
     } : null;
-    // Auto-add to stocks master if new symbol
-    const autoAddStock = !masterSt ? {id:uid(),symbol,name:name||symbol,type:invType,exchange:""} : null;
-    onSave({itx,newHolding,isFD:false,autoAddStock});
+    onSave({itx,newHolding,isFD:false});
     toast(isEdit?"Trade updated":txType==="buy"?"Buy recorded":"Sell recorded");
     onClose();
   }
@@ -2761,26 +2966,32 @@ function InvestModal({ state, onClose, onSave, editTx }) {
         <>
           <div style={{position:"relative",marginBottom:14}}>
             <label style={{display:"block",fontSize:12,fontWeight:600,color:"#64748B",marginBottom:6,textTransform:"uppercase",letterSpacing:"0.05em"}}>
-              {isMF?"Fund Name / Code":"Stock Symbol or Name"}
+              {isMF?"Fund Code / NAV Symbol":"Symbol (e.g. NSE:ITBEES, TCS)"}
             </label>
-            <input
-              value={symbol}
-              onChange={e=>onSymbolChange(e.target.value)}
-              onFocus={()=>setShowSugg(true)}
-              onBlur={()=>setTimeout(()=>setShowSugg(false),200)}
-              placeholder={isMF?"e.g. ICICI Pru, Mirae, NIFTY50":"e.g. ITC, TCS, INFY"}
-              style={{...inputStyle}}
-            />
-            {showSugg && suggestions.length > 0 && (
-              <div style={{position:"absolute",left:0,right:0,top:"100%",background:"#fff",border:"1.5px solid #E2E8F0",borderRadius:10,zIndex:600,boxShadow:"0 8px 24px rgba(0,0,0,0.12)",maxHeight:200,overflowY:"auto"}}>
-                {suggestions.map((s,i) => (
-                  <button key={i} onMouseDown={()=>selectSuggestion(s)}
-                    style={{display:"block",width:"100%",textAlign:"left",padding:"9px 12px",border:"none",background:"#fff",cursor:"pointer",borderBottom:i<suggestions.length-1?"1px solid #F1F5F9":"none",fontFamily:"inherit"}}>
-                    <div style={{fontWeight:700,fontSize:13,color:"#0F172A"}}>{s.symbol}</div>
-                    <div style={{fontSize:11,color:"#94A3B8"}}>{s.name}</div>
-                  </button>
-                ))}
+            <div style={{display:"flex",gap:6}}>
+              <div style={{flex:1,position:"relative"}}>
+                <input value={symQuery} onChange={e=>onSymQueryChange(e.target.value)}
+                  onFocus={()=>symSugg.length>0&&setShowSugg(true)}
+                  onBlur={()=>setTimeout(()=>setShowSugg(false),200)}
+                  placeholder={isMF?"MUTF_IN:ICIC_PRUN, Mirae…":"NSE:ITBEES, TCS, RELIANCE…"}
+                  style={{...inputStyle}} />
+
+                {showSugg&&symSugg.length>0&&(
+                  <div style={{position:"absolute",left:0,right:0,top:"100%",background:"#fff",border:"1.5px solid #E2E8F0",borderRadius:10,zIndex:600,boxShadow:"0 8px 24px rgba(0,0,0,0.12)",maxHeight:200,overflowY:"auto"}}>
+                    {symSugg.map((s,i)=>(
+                      <button key={i} onMouseDown={()=>selectSymbol(s)}
+                        style={{display:"block",width:"100%",textAlign:"left",padding:"9px 12px",border:"none",background:"#F8FAFC",cursor:"pointer",borderBottom:i<symSugg.length-1?"1px solid #F1F5F9":"none",fontFamily:"inherit"}}>
+                        <div style={{fontWeight:700,fontSize:13,color:"#0F172A"}}>{s.symbol}</div>
+                        <div style={{fontSize:11,color:"#64748B"}}>{s.name}</div>
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
+
+            </div>
+            {symbol&&symSugg.length===0&&symbol.length>0&&(
+              <div style={{fontSize:11,color:"#6366F1",marginTop:3}}>✅ {symbol} — type name below or leave blank</div>
             )}
           </div>
           <Inp label="Full Name (optional)" value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. Tata Consultancy Services" />
@@ -2900,10 +3111,14 @@ function HoldingRow({ holding, investmentTx, accounts, state, dispatch, openId, 
   const [renameSymbol, setRenameSymbol] = useState(holding.symbol);
   const [renameName,   setRenameName]   = useState(holding.name||"");
 
-  const cur = holding.currency||"INR";
-  const qty = holding.quantity||holding.units||0;
-  const avgPrice = holding.avgPrice||holding.nav||0;
+  const cur         = holding.currency||"INR";
+  const qty         = holding.quantity||holding.units||0;
+  const avgPrice    = holding.avgPrice||holding.nav||0;
   const investedAmt = holding.investedAmount || qty*avgPrice;
+  // Current value = invested amount (trade prices only — no market price)
+  const currentVal  = investedAmt;
+  const totalDiff   = 0;
+  const pctDiff     = 0;
   const fxRates     = state?.fxRates||DEFAULT.fxRates;
   const broker      = accounts.find(a=>a.id===holding.accountId);
   const tradeCount  = (investmentTx||[]).filter(t=>t.holdingId===holding.id || t.symbol===holding.symbol).length;
@@ -2953,8 +3168,19 @@ function HoldingRow({ holding, investmentTx, accounts, state, dispatch, openId, 
           </div>
         </div>
         <div style={{textAlign:"right",flexShrink:0}}>
-          <div style={{fontWeight:700,fontSize:14}}>{fmtCur(investedAmt,cur)}</div>
-          <div style={{fontSize:11,color:"#94A3B8"}}>invested</div>
+          {livePrice ? (
+            <>
+              <div style={{fontWeight:700,fontSize:14}}>{fmtCur(currentVal,cur)}</div>
+              <div style={{fontSize:11,fontWeight:600,color:totalDiff>=0?"#10B981":"#EF4444"}}>
+                {totalDiff>=0?"▲":"▼"}{Math.abs(pctDiff).toFixed(1)}%
+              </div>
+            </>
+          ) : (
+            <>
+              <div style={{fontWeight:700,fontSize:14}}>{fmtCur(investedAmt,cur)}</div>
+              <div style={{fontSize:11,color:"#94A3B8"}}>invested</div>
+            </>
+          )}
         </div>
         <span style={{color:"#94A3B8",fontSize:12,flexShrink:0}}>{isOpen?"▲":"▼"}</span>
       </div>
@@ -2975,6 +3201,7 @@ function HoldingRow({ holding, investmentTx, accounts, state, dispatch, openId, 
               </div>
             ))}
           </div>
+
           <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
             <button onClick={e=>{e.stopPropagation();setShowHistory(true);}}
               style={{fontSize:12,padding:"7px 14px",borderRadius:8,border:"1.5px solid #C7D2FE",background:"#fff",color:"#6366F1",cursor:"pointer",fontFamily:"inherit",fontWeight:700}}>
@@ -3042,15 +3269,49 @@ function FDCard({ fd, accounts, dispatch, state }) {
   const isMatured = matDate <= today;
   const daysLeft = Math.max(0, Math.ceil((matDate-today)/(1000*60*60*24)));
   const nonInvAccounts = accounts.filter(a => !a.disabled && !a.isInvestmentType);
+  const isClosed = fd.status === "closed";
 
   function closeFD() {
     const interest = parseFloat(overrideInterest) || r.interest;
-    if (!window.confirm(`Close FD?
-• Principal ₹${r.principal.toLocaleString()} → source account
-• Interest ₹${interest.toLocaleString()} → income transaction`)) return;
+    if (!closeAccId) { toast("Select an account to receive the FD amount","error"); return; }
+    if (!window.confirm("Close FD?\n\u2022 Principal will be transferred to selected account\n\u2022 Interest will be recorded as income transaction")) return;
     dispatch({ type:"CLOSE_FD", payload:{ fdId:fd.id, incomeAccId:closeAccId, interestAmt:interest, closeDate } });
-    toast("FD closed. Principal returned + interest logged as income.");
+    toast("FD closed. Principal transferred + interest logged as income.");
     setShowClose(false);
+  }
+
+  function undoClose() {
+    if (!window.confirm("Undo closing this FD?\nThis will:\n\u2022 Reverse the principal transfer\n\u2022 Remove the interest income transaction\n\u2022 Restore the FD to active status")) return;
+    dispatch({ type:"UNDO_CLOSE_FD", payload: fd.id });
+    toast("FD close reversed — restored to active.");
+  }
+
+  if (isClosed) {
+    return (
+      <Card style={{padding:"12px 14px",borderLeft:"4px solid #94A3B8",marginBottom:10,background:"#F8FAFC",opacity:0.85}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+          <div>
+            <div style={{fontWeight:700,fontSize:14,color:"#475569"}}>{fd.name||"Fixed Deposit"}</div>
+            <div style={{fontSize:11,color:"#94A3B8",marginTop:2}}>{broker?.name||""} · {fd.interestRate}% p.a.</div>
+          </div>
+          <div style={{textAlign:"right"}}>
+            <div style={{fontWeight:800,fontSize:15,color:"#94A3B8"}}>{fmtCur(r.principal,fd.currency||"INR")}</div>
+            <div style={{fontSize:10,color:"#94A3B8"}}>Original principal</div>
+          </div>
+        </div>
+        <div style={{background:"#F1F5F9",borderRadius:8,padding:"8px 10px",marginBottom:8,fontSize:12,color:"#64748B"}}>
+          <div>✅ Closed on {fd.closeDate ? fmtDate(fd.closeDate) : "—"}</div>
+          <div style={{marginTop:2}}>Principal transferred: {fmtCur(r.principal,fd.currency||"INR")} · Interest: {fmtCur(fd.closedInterest||0,fd.currency||"INR")}</div>
+        </div>
+        <div style={{display:"flex",gap:5,alignItems:"center",flexWrap:"wrap"}}>
+          <span style={{fontSize:10,background:"#F1F5F9",color:"#94A3B8",padding:"2px 7px",borderRadius:8,fontWeight:600}}>Closed</span>
+          <button onClick={undoClose}
+            style={{fontSize:11,padding:"3px 10px",borderRadius:6,border:"1.5px solid #FDE68A",background:"#FFFBEB",color:"#92400E",cursor:"pointer",fontFamily:"inherit",fontWeight:700}}>↩️ Undo Close</button>
+          <button onClick={()=>{if(window.confirm("Delete this FD record permanently?"))dispatch({type:"DELETE_FD",payload:fd.id});}}
+            style={{fontSize:11,padding:"3px 8px",borderRadius:6,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>🗑️ Delete</button>
+        </div>
+      </Card>
+    );
   }
 
   return (
@@ -3078,6 +3339,10 @@ function FDCard({ fd, accounts, dispatch, state }) {
       {showClose&&(
         <div style={{background:"#F0FDF4",border:"1.5px solid #A7F3D0",borderRadius:10,padding:"12px",marginBottom:10}}>
           <div style={{fontSize:13,fontWeight:700,color:"#065F46",marginBottom:10}}>🏦 Close Fixed Deposit</div>
+          <div style={{background:"#ECFDF5",borderRadius:8,padding:"8px 10px",marginBottom:10,fontSize:12,color:"#065F46"}}>
+            <div>💰 Principal <strong>{fmtCur(r.principal, fd.currency||"INR")}</strong> → transferred to account below</div>
+            <div style={{marginTop:3}}>📈 Interest → recorded as income transaction</div>
+          </div>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
             <div>
               <div style={{fontSize:11,color:"#64748B",marginBottom:4}}>Close Date</div>
@@ -3092,7 +3357,7 @@ function FDCard({ fd, accounts, dispatch, state }) {
             </div>
           </div>
           <div style={{marginBottom:8}}>
-            <div style={{fontSize:11,color:"#64748B",marginBottom:4}}>Credit interest & principal to</div>
+            <div style={{fontSize:11,color:"#64748B",marginBottom:4}}>Transfer principal to account</div>
             <select value={closeAccId} onChange={e=>setCloseAccId(e.target.value)} style={{...inputStyle,padding:"7px 10px",fontSize:13,background:"#fff"}}>
               <option value="">— Select account —</option>
               {nonInvAccounts.map(a=><option key={a.id} value={a.id}>{a.icon||""} {a.name}</option>)}
@@ -3118,7 +3383,6 @@ function FDCard({ fd, accounts, dispatch, state }) {
     </Card>
   );
 }
-
 // ─── IMPORT MODAL ─────────────────────────────────────────────────────────────
 // Supports CSV + XLSX import for trades, expenses, income.
 // Validates columns; shows errors; dispatches bulk on confirm.
@@ -3615,8 +3879,7 @@ function InvestmentsView({ state, dispatch }) {
   const [editHistoryTrade, setEditHistoryTrade] = useState(null);
   const [bulkSelectMode,   setBulkSelectMode]   = useState(false);
   const [selectedSymbols,  setSelectedSymbols]  = useState([]);
-  const [selectedTrades,   setSelectedTrades]   = useState(new Set());
-  // (no market price refresh needed — prices removed in v12)
+  const [selectedTrades,   setSelectedTrades]   = useState(new Set()); // for bulk delete in history tab
 
   // Listen for FAB event from App
   useEffect(()=>{
@@ -3629,16 +3892,16 @@ function InvestmentsView({ state, dispatch }) {
   const investmentTx = state?.investmentTx||[];
   const fixedDeposits= state?.fixedDeposits||[];
   const fxRates      = state?.fxRates     ||DEFAULT.fxRates;
+  const marketPrices = state?.marketPrices ||{};
 
   const holdings = state?.holdings||[];
 
   const stocks = holdings.filter(h=>h.type==="stock");
   const mfs    = holdings.filter(h=>h.type==="mf");
-  // Value from invested amounts only (no live price)
-  const holdingInvestedVal = h => h.investedAmount || (h.quantity||h.units||0)*(h.avgPrice||h.nav||0);
-  const stockVal = stocks.reduce((s,h)=>s+toINR(holdingInvestedVal(h),h.currency,fxRates),0);
-  const mfVal    = mfs.reduce(  (s,h)=>s+toINR(holdingInvestedVal(h),h.currency,fxRates),0);
-  const fdVal    = fixedDeposits.reduce((s,fd)=>s+toINR(parseFloat(fd.amount)||0,fd.currency||"INR",fxRates),0);
+  const holdingCurrentVal = h => h.investedAmount||(h.quantity||h.units||0)*(h.avgPrice||h.nav||0)||0;
+  const stockVal = stocks.reduce((s,h)=>s+toINR(holdingCurrentVal(h),h.currency,fxRates),0);
+  const mfVal    = mfs.reduce(  (s,h)=>s+toINR(holdingCurrentVal(h),h.currency,fxRates),0);
+  const fdVal    = fixedDeposits.filter(fd=>fd.status!=="closed").reduce((s,fd)=>s+toINR(parseFloat(fd.amount)||0,fd.currency||"INR",fxRates),0);
   const sortedTx = [...investmentTx].sort((a,b)=>new Date(b.date)-new Date(a.date));
 
   function toggleHolding(id) {
@@ -3657,6 +3920,7 @@ function InvestmentsView({ state, dispatch }) {
     toast(`Deleted ${selectedSymbols.length} holding(s)`);
   }
 
+
   return (
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:8}}>
@@ -3665,6 +3929,7 @@ function InvestmentsView({ state, dispatch }) {
           <Btn variant="ghost" size="sm" onClick={()=>setShowStocksMaster(true)}>📚 Master</Btn>
           <Btn variant="ghost" size="sm" onClick={()=>setShowImport(true)}>⬆️ Import</Btn>
           <Btn variant="warning" size="sm" onClick={()=>setShowCorpAction(true)}>⚡ Corp.</Btn>
+
           <Btn size="sm" onClick={()=>setShowAdd(true)}>+ Trade</Btn>
         </div>
       </div>
@@ -3696,12 +3961,13 @@ function InvestmentsView({ state, dispatch }) {
         </div>
       )}
 
-      {/* ── Portfolio Summary Bar: total invested + realized P&L ── */}
+      {/* ── Portfolio Summary Bar (7): total invested, current value, P&L ── */}
       {(stocks.length>0||mfs.length>0)&&(()=>{
         const totalInvested = [...stocks,...mfs].reduce((s,h)=>s+toINR(h.investedAmount||0,h.currency,fxRates),0);
-        const realized      = buildRealizedTrades(investmentTx);
-        const realizedPnl   = realized.reduce((s,r)=>s+r.pnl,0);
-        const isGain        = realizedPnl>=0;
+        const totalCurrent  = [...stocks,...mfs].reduce((s,h)=>s+toINR(holdingCurrentVal(h),h.currency,fxRates),0);
+        const pnl           = totalCurrent - totalInvested;
+        const pnlPct        = totalInvested>0?(pnl/totalInvested)*100:0;
+        const isGain        = pnl>=0;
         return (
           <Card style={{marginBottom:16,background:"linear-gradient(135deg,#0F172A,#1E293B)",color:"#fff",padding:"16px 18px"}}>
             <div style={{fontSize:11,color:"rgba(255,255,255,0.5)",fontWeight:600,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:10}}>Portfolio Summary</div>
@@ -3711,18 +3977,22 @@ function InvestmentsView({ state, dispatch }) {
                 <div style={{fontSize:20,fontWeight:800,color:"#fff"}}>{fmtINR(totalInvested)}</div>
               </div>
               <div>
-                <div style={{fontSize:11,color:"rgba(255,255,255,0.5)",marginBottom:3}}>Realized P&L</div>
-                <div style={{fontSize:20,fontWeight:800,color:isGain?"#A7F3D0":"#FCA5A5"}}>{isGain?"+":""}{fmtINR(realizedPnl)}</div>
+                <div style={{fontSize:11,color:"rgba(255,255,255,0.5)",marginBottom:3}}>Current Value</div>
+                <div style={{fontSize:20,fontWeight:800,color:"#A7F3D0"}}>{fmtINR(totalCurrent)}</div>
               </div>
             </div>
             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",background:"rgba(255,255,255,0.08)",borderRadius:10,padding:"10px 14px"}}>
               <div>
-                <div style={{fontSize:11,color:"rgba(255,255,255,0.5)",marginBottom:2}}>Open Holdings</div>
-                <div style={{fontSize:17,fontWeight:800,color:"#fff"}}>{stocks.length+mfs.length} position{stocks.length+mfs.length!==1?"s":""}</div>
+                <div style={{fontSize:11,color:"rgba(255,255,255,0.5)",marginBottom:2}}>Total P&L</div>
+                <div style={{fontSize:17,fontWeight:800,color:isGain?"#6EE7B7":"#FCA5A5"}}>
+                  {isGain?"+":"−"}{fmtINR(Math.abs(pnl))}
+                </div>
               </div>
               <div style={{textAlign:"right"}}>
-                <div style={{fontSize:11,color:"rgba(255,255,255,0.5)",marginBottom:2}}>Closed Trades</div>
-                <div style={{fontSize:20,fontWeight:800,color:"#A7F3D0"}}>{realized.length}</div>
+                <div style={{fontSize:11,color:"rgba(255,255,255,0.5)",marginBottom:2}}>Returns</div>
+                <div style={{fontSize:20,fontWeight:800,color:isGain?"#6EE7B7":"#FCA5A5"}}>
+                  {isGain?"+":""}{pnlPct.toFixed(2)}%
+                </div>
               </div>
             </div>
           </Card>
@@ -3735,7 +4005,7 @@ function InvestmentsView({ state, dispatch }) {
           {label:"Portfolio",        value:fmtINR(stockVal+mfVal+fdVal), color:"#6366F1", bg:"#EEF2FF", icon:"📊"},
           {label:`Stocks (${stocks.length})`,  value:fmtINR(stockVal),  color:"#0EA5E9", bg:"#F0F9FF", icon:"📈"},
           {label:`MF (${mfs.length})`,         value:fmtINR(mfVal),     color:"#10B981", bg:"#F0FDF4", icon:"📉"},
-          {label:`FD (${fixedDeposits.length})`,value:fmtINR(fdVal),    color:"#F59E0B", bg:"#FFFBEB", icon:"🏦"},
+          {label:`FD (${fixedDeposits.filter(f=>f.status!=="closed").length})`,value:fmtINR(fdVal),    color:"#F59E0B", bg:"#FFFBEB", icon:"🏦"},
         ].map(s=>(
           <Card key={s.label} style={{background:s.bg,padding:12,textAlign:"center"}}>
             <div style={{fontSize:18,marginBottom:4}}>{s.icon}</div>
@@ -3799,7 +4069,7 @@ function InvestmentsView({ state, dispatch }) {
       {/* ── Fixed Deposits tab ── */}
       {tab==="fd"&&(
         <div>
-          {fixedDeposits.length===0&&(state?.closedFDs||[]).length===0&&(
+          {fixedDeposits.length===0&&(
             <Card style={{textAlign:"center",padding:48,color:"#94A3B8"}}>
               <div style={{fontSize:40}}>🏦</div>
               <div style={{marginTop:8,fontWeight:600}}>No fixed deposits</div>
@@ -3809,40 +4079,6 @@ function InvestmentsView({ state, dispatch }) {
           {fixedDeposits.map(fd=>(
             <FDCard key={fd.id} fd={fd} accounts={accounts} dispatch={dispatch} state={state} />
           ))}
-          {/* Recently closed FDs — with Undo option */}
-          {(state?.closedFDs||[]).length>0&&(
-            <div style={{marginTop:fixedDeposits.length>0?16:0}}>
-              <div style={{fontSize:12,fontWeight:700,color:"#94A3B8",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>Recently Closed</div>
-              {[...(state.closedFDs||[])].reverse().map(snap=>{
-                const targetAcc = accounts.find(a=>a.id===snap.targetAccId);
-                return (
-                  <Card key={snap.snapshotId} style={{padding:"12px 14px",marginBottom:8,borderLeft:"4px solid #94A3B8",opacity:0.85}}>
-                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
-                      <div>
-                        <div style={{fontWeight:700,fontSize:14,color:"#475569"}}>{snap.fd.name||"Fixed Deposit"}</div>
-                        <div style={{fontSize:11,color:"#94A3B8",marginTop:2}}>
-                          Principal: {fmtCur(snap.principal,snap.fd.currency||"INR")}
-                          {snap.interest>0&&` · Interest: ${fmtCur(snap.interest,snap.fd.currency||"INR")}`}
-                        </div>
-                        <div style={{fontSize:11,color:"#94A3B8",marginTop:2}}>
-                          Closed {fmtDate(snap.closeDate)}{targetAcc?` → ${targetAcc.name}`:""}
-                        </div>
-                      </div>
-                      <button
-                        onClick={()=>{
-                          if(!window.confirm(`Undo closing "${snap.fd.name||"Fixed Deposit"}"?\nThis will:\n• Restore the FD\n• Reverse the principal credit (−${fmtCur(snap.principal,snap.fd.currency||"INR")})\n• Reverse the interest income${snap.interest>0?` (−${fmtCur(snap.interest,snap.fd.currency||"INR")})`:""}`))return;
-                          dispatch({type:"UNDO_CLOSE_FD",payload:snap.snapshotId});
-                          toast(`FD "${snap.fd.name||"Fixed Deposit"}" restored`);
-                        }}
-                        style={{flexShrink:0,fontSize:12,padding:"6px 12px",borderRadius:8,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:700,whiteSpace:"nowrap"}}>
-                        ↩ Undo Close
-                      </button>
-                    </div>
-                  </Card>
-                );
-              })}
-            </div>
-          )}
         </div>
       )}
 
@@ -3946,32 +4182,49 @@ function InvestmentsView({ state, dispatch }) {
         </div>
       )}
 
-      {/* ── Profits tab — FIFO realized P&L ── */}
+      {/* ── Profits tab — per-stock summary only ── */}
       {tab==="profits"&&(()=>{
         const realized = buildRealizedTrades(investmentTx);
         const netPnl   = realized.reduce((s,r)=>s+r.pnl,0);
 
-        // Aggregate by symbol — summary only, no individual trade rows
+        // Aggregate by symbol
         const bySymbol = {};
         realized.forEach(r=>{
-          if(!bySymbol[r.symbol]) bySymbol[r.symbol]={symbol:r.symbol,name:r.name,totalShares:0,totalPnl:0,currency:r.currency};
-          bySymbol[r.symbol].totalShares += r.qty;
-          bySymbol[r.symbol].totalPnl   += r.pnl;
+          if(!bySymbol[r.symbol]) bySymbol[r.symbol]={symbol:r.symbol,name:r.name,totalQty:0,totalPnl:0};
+          bySymbol[r.symbol].totalQty += r.qty;
+          bySymbol[r.symbol].totalPnl += r.pnl;
         });
         const summaries = Object.values(bySymbol).sort((a,b)=>Math.abs(b.totalPnl)-Math.abs(a.totalPnl));
 
         return (
           <div>
-            {/* Net realized banner */}
-            <Card style={{background:netPnl>=0?"#F0FDF4":"#FEF2F2",border:`1.5px solid ${netPnl>=0?"#A7F3D0":"#FECACA"}`,marginBottom:16,padding:"14px 16px"}}>
-              <div style={{fontSize:11,color:"#64748B",marginBottom:4}}>Net Realized P&L</div>
-              <div style={{fontSize:28,fontWeight:800,color:netPnl>=0?"#10B981":"#EF4444"}}>
-                {netPnl>=0?"+":""}{fmtINR(netPnl)}
+            {/* Summary banner */}
+            <Card style={{background:netPnl>=0?"#F0FDF4":"#FEF2F2",border:`1.5px solid ${netPnl>=0?"#A7F3D0":"#FECACA"}`,marginBottom:16,padding:16}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
+                <div>
+                  <div style={{fontSize:11,color:"#64748B",marginBottom:2}}>Net Realized P&L</div>
+                  <div style={{fontSize:26,fontWeight:800,color:netPnl>=0?"#10B981":"#EF4444"}}>
+                    {netPnl>=0?"+":""}{fmtINR(netPnl)}
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:12}}>
+                  <div style={{textAlign:"center"}}>
+                    <div style={{fontSize:18,fontWeight:800,color:"#10B981"}}>{summaries.filter(s=>s.totalPnl>0).length}</div>
+                    <div style={{fontSize:10,color:"#64748B"}}>Winning</div>
+                  </div>
+                  <div style={{textAlign:"center"}}>
+                    <div style={{fontSize:18,fontWeight:800,color:"#EF4444"}}>{summaries.filter(s=>s.totalPnl<0).length}</div>
+                    <div style={{fontSize:10,color:"#64748B"}}>Losing</div>
+                  </div>
+                  <div style={{textAlign:"center"}}>
+                    <div style={{fontSize:18,fontWeight:800,color:"#6366F1"}}>{summaries.length}</div>
+                    <div style={{fontSize:10,color:"#64748B"}}>Stocks</div>
+                  </div>
+                </div>
               </div>
-              <div style={{fontSize:12,color:"#94A3B8",marginTop:4}}>{summaries.length} stock{summaries.length!==1?"s":""} · {realized.length} closed trade{realized.length!==1?"s":""}</div>
             </Card>
 
-            {realized.length===0&&(
+            {summaries.length===0&&(
               <Card style={{textAlign:"center",padding:48,color:"#94A3B8"}}>
                 <div style={{fontSize:40}}>📊</div>
                 <div style={{marginTop:8,fontWeight:600}}>No closed trades yet</div>
@@ -3979,45 +4232,46 @@ function InvestmentsView({ state, dispatch }) {
               </Card>
             )}
 
-            {/* One card per stock — summary only */}
-            {summaries.map(g=>{
-              const isProfit = g.totalPnl >= 0;
-              return (
-                <Card key={g.symbol} style={{marginBottom:10,padding:"14px 16px",borderLeft:`4px solid ${isProfit?"#10B981":"#EF4444"}`}}>
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            {/* Per-stock summary cards */}
+            {summaries.length>0&&(
+              <Card style={{padding:0}}>
+                <div style={{padding:"10px 14px",borderBottom:"1px solid #F1F5F9",display:"flex",justifyContent:"space-between",fontSize:11,fontWeight:700,color:"#94A3B8",textTransform:"uppercase",letterSpacing:"0.05em"}}>
+                  <span>Stock</span>
+                  <span style={{display:"flex",gap:40}}><span>Shares Sold</span><span>Net P&L</span></span>
+                </div>
+                {summaries.map((s,i)=>(
+                  <div key={s.symbol} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 14px",borderBottom:i<summaries.length-1?"1px solid #F1F5F9":"none",background:s.totalPnl>=0?"#FAFFFE":"#FFFAFA"}}>
                     <div>
-                      <div style={{fontWeight:800,fontSize:16,color:"#0F172A"}}>{g.symbol}</div>
-                      <div style={{fontSize:12,color:"#94A3B8",marginTop:2}}>{g.name}</div>
-                      <div style={{fontSize:12,color:"#64748B",marginTop:4}}>
-                        Shares Sold: <strong>{fmtNum(g.totalShares)}</strong>
-                      </div>
+                      <div style={{fontWeight:800,fontSize:14,color:"#0F172A"}}>{s.symbol}</div>
+                      <div style={{fontSize:11,color:"#94A3B8",marginTop:1}}>{s.name}</div>
                     </div>
-                    <div style={{textAlign:"right"}}>
-                      <div style={{fontWeight:800,fontSize:18,color:isProfit?"#10B981":"#EF4444"}}>
-                        {isProfit?"+":""}{fmtINR(g.totalPnl)}
+                    <div style={{display:"flex",gap:32,alignItems:"center"}}>
+                      <div style={{textAlign:"center"}}>
+                        <div style={{fontWeight:700,fontSize:14,color:"#475569"}}>{fmtNum(s.totalQty)}</div>
+                        <div style={{fontSize:10,color:"#94A3B8"}}>shares sold</div>
                       </div>
-                      <div style={{fontSize:12,color:isProfit?"#10B981":"#EF4444",fontWeight:600,marginTop:2}}>
-                        {isProfit?"Net Profit":"Net Loss"}
+                      <div style={{textAlign:"right",minWidth:90}}>
+                        <div style={{fontWeight:800,fontSize:15,color:s.totalPnl>=0?"#10B981":"#EF4444"}}>
+                          {s.totalPnl>=0?"+":""}{fmtINR(s.totalPnl)}
+                        </div>
+                        <div style={{fontSize:10,color:s.totalPnl>=0?"#10B981":"#EF4444",fontWeight:600}}>
+                          {s.totalPnl>=0?"Net Profit":"Net Loss"}
+                        </div>
                       </div>
                     </div>
                   </div>
-                </Card>
-              );
-            })}
+                ))}
+              </Card>
+            )}
           </div>
         );
       })()}
-
       {showAdd&&(
         <InvestModal state={state} onClose={()=>setShowAdd(false)}
-          onSave={({itx,newHolding,fd,isFD,autoAddStock})=>{
+          onSave={({itx,newHolding,fd,isFD})=>{
             if(isFD){
               dispatch({type:"ADD_FD",payload:fd});
             } else {
-              // Auto-add to stocks master if not present
-              if(autoAddStock && !(state?.stocks||[]).find(s=>s.symbol===autoAddStock.symbol)) {
-                dispatch({type:"ADD_STOCK",payload:autoAddStock});
-              }
               dispatch({type:"ADD_INVESTMENT",payload:{itx,newHolding}});
             }
           }}
@@ -4609,6 +4863,25 @@ export default function App() {
   useEffect(() => {
     try { localStorage.setItem("wealthmap_view", view); } catch {}
   }, [view]);
+
+  // ── Live price auto-fetch: refresh all stock/MF prices every 5 minutes
+  useEffect(() => {
+    const stocks = stateRef.current?.stocks || [];
+    if (stocks.length === 0) return;
+    async function refreshPrices() {
+      const symbols = stocks.map(s => s.symbol).filter(Boolean);
+      if (symbols.length === 0) return;
+      try {
+        const prices = await fetchMultiplePrices(symbols);
+        Object.entries(prices).forEach(([sym, price]) => {
+          dispatch({ type: "UPDATE_MARKET_PRICE", payload: { symbol: sym, current_price: price } });
+        });
+      } catch { /* silent fail */ }
+    }
+    refreshPrices(); // immediate on mount
+    const interval = setInterval(refreshPrices, 5 * 60 * 1000); // every 5 min
+    return () => clearInterval(interval);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // FAB config per view
   const fabConfig = {
