@@ -3564,13 +3564,13 @@ function ImportModal({ state, dispatch, onClose }) {
         const price     = parseFloat(row.price);
 
         if (!tradeDate || isNaN(Date.parse(tradeDate)))
-          errs.push("Row " + (i+2) + ": invalid trade_date "" + tradeDate + """);
+          errs.push('Row ' + (i+2) + ': invalid trade_date "' + tradeDate + '"');
         if (!["buy","sell"].includes(tradeType))
-          errs.push("Row " + (i+2) + ": trade_type must be buy or sell, got "" + row.trade_type + """);
+          errs.push('Row ' + (i+2) + ': trade_type must be buy or sell, got "' + row.trade_type + '"');
         if (isNaN(qty) || qty <= 0)
-          errs.push("Row " + (i+2) + ": invalid quantity "" + row.quantity + """);
+          errs.push('Row ' + (i+2) + ': invalid quantity "' + row.quantity + '"');
         if (isNaN(price) || price <= 0)
-          errs.push("Row " + (i+2) + ": invalid price "" + row.price + """);
+          errs.push('Row ' + (i+2) + ': invalid price "' + row.price + '"');
         if (!row.stock_name)
           errs.push("Row " + (i+2) + ": missing symbol");
 
@@ -3593,10 +3593,10 @@ function ImportModal({ state, dispatch, onClose }) {
         const row  = {};
         headers.forEach((h, j) => row[h.toLowerCase()] = vals[j] || "");
         if (!row.date || isNaN(Date.parse(row.date)))
-          errs.push("Row " + (i+2) + ": invalid date "" + row.date + """);
+          errs.push('Row ' + (i+2) + ': invalid date "' + row.date + '"');
         if (type !== "trade") {
           if (!row.amount || isNaN(parseFloat(row.amount)))
-            errs.push("Row " + (i+2) + ": invalid amount "" + row.amount + """);
+            errs.push('Row ' + (i+2) + ': invalid amount "' + row.amount + '"');
         } else {
           if (!row.quantity || isNaN(parseFloat(row.quantity)))
             errs.push("Row " + (i+2) + ": invalid quantity");
