@@ -1,5 +1,10 @@
 // ============================================================
-// WEALTHMAP v12 — UX Overhaul + Account Sync Fix
+// WEALTHMAP v13 — Zerodha Tradebook V2 Import Template
+// Changes vs v12:
+//  1.  ZERODHA_TRADEBOOK_V2 import template added
+//  2.  External trade_id dedup for broker CSV imports
+//  3.  Import result summary (processed / imported / skipped / errors)
+//  4.  Broker format auto-detection from column headers
 // Changes vs v11:
 //  1.  FD Close: Undo support (FD marked closed, not deleted)
 //  2.  Profits tab: summary per stock only (no individual trade rows)
@@ -16,7 +21,7 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = "https://hqkqhgrfcwixqoehjfaj.supabase.co";
 const SUPABASE_KEY = "sb_publishable_N-ZcUkVL6fF-pch1sZPg6Q_hbd8sUPv";
 const supabase     = createClient(SUPABASE_URL, SUPABASE_KEY);
-const STORAGE_KEY  = "wealthmap_v12";
+const STORAGE_KEY  = "wealthmap_v13";
 
 // ─── CURRENCIES ───────────────────────────────────────────────────────────────
 const CURRENCIES = [
@@ -3387,37 +3392,105 @@ function FDCard({ fd, accounts, dispatch, state }) {
 // Supports CSV + XLSX import for trades, expenses, income.
 // Validates columns; shows errors; dispatches bulk on confirm.
 function ImportModal({ state, dispatch, onClose }) {
-  const [importType, setImportType] = useState("expense");
-  const [rows,       setRows]       = useState([]);
-  const [errors,     setErrors]     = useState([]);
-  const [fileName,   setFileName]   = useState("");
-  const [loading,    setLoading]    = useState(false);
+  const [importType,   setImportType]   = useState("expense");
+  const [rows,         setRows]         = useState([]);
+  const [errors,       setErrors]       = useState([]);
+  const [fileName,     setFileName]     = useState("");
+  const [loading,      setLoading]      = useState(false);
+  const [importResult, setImportResult] = useState(null); // { total, imported, skipped, errors } after import
   const fileRef = useRef(null);
 
+  // ── IMPORT TEMPLATE REGISTRY ─────────────────────────────────────────────
+  // Standard templates: expense, income, trade (WealthMap native format)
+  // Broker templates:   zerodha_v2 (ZERODHA_TRADEBOOK_V2)
+  //
+  // Broker templates have a `brokerFormat: true` flag and define:
+  //   • cols          — required CSV column headers (used for validation)
+  //   • colMap        — maps CSV column → internal field name
+  //   • ignoredCols   — columns to silently ignore
+  //   • externalIdCol — CSV column to use as unique external trade ID for dedup
+  //   • sample        — one example row (for download template)
+  // ─────────────────────────────────────────────────────────────────────────
   const TEMPLATES = {
-    expense: { cols:["Date","Amount","Category","Account","Note"], sample:[["2024-01-15","1500","Food & Dining","SBI Savings","Lunch"],["2024-01-16","500","Transport","SBI Savings","Auto"]] },
-    income:  { cols:["Date","Amount","Category","Account","Note"], sample:[["2024-01-01","50000","Salary","SBI Savings","Jan salary"]] },
-    trade:   { cols:["Date","Symbol","Type","Quantity","Price","InvestmentAccount","SourceAccount","Note"], sample:[["2024-01-10","TCS","buy","10","3500","Zerodha","SBI Savings","Q4 buy"]] },
+    expense: {
+      cols:   ["Date","Amount","Category","Account","Note"],
+      sample: [["2024-01-15","1500","Food & Dining","SBI Savings","Lunch"],
+               ["2024-01-16","500","Transport","SBI Savings","Auto"]],
+    },
+    income: {
+      cols:   ["Date","Amount","Category","Account","Note"],
+      sample: [["2024-01-01","50000","Salary","SBI Savings","Jan salary"]],
+    },
+    trade: {
+      cols:   ["Date","Symbol","Type","Quantity","Price","InvestmentAccount","SourceAccount","Note"],
+      sample: [["2024-01-10","TCS","buy","10","3500","Zerodha","SBI Savings","Q4 buy"]],
+    },
+
+    // ── ZERODHA_TRADEBOOK_V2 ──────────────────────────────────────────────
+    // Broker CSV export format from Zerodha Console → Tradebook.
+    // Columns: symbol,isin,trade_date,exchange,segment,series,trade_type,
+    //          auction,quantity,price,trade_id,order_id,order_execution_time
+    zerodha_v2: {
+      brokerFormat:  true,
+      label:         "🟠 Zerodha Tradebook",
+      cols:          ["symbol","isin","trade_date","exchange","segment","series",
+                      "trade_type","auction","quantity","price","trade_id",
+                      "order_id","order_execution_time"],
+      // Maps CSV column name → internal field used when building the trade object
+      colMap: {
+        symbol:     "stock_name",
+        trade_date: "trade_date",
+        trade_type: "trade_type",
+        quantity:   "quantity",
+        price:      "price",
+        exchange:   "exchange",
+        trade_id:   "external_trade_id",
+      },
+      // Columns to silently ignore — never validated, never used
+      ignoredCols: ["isin","segment","series","auction","order_id","order_execution_time"],
+      // CSV column whose value is used as the unique dedup key
+      externalIdCol: "trade_id",
+      // Sample row matching the Zerodha format exactly
+      sample: [["IRCTC","INE335Y01020","2022-02-09","NSE","EQ","EQ",
+                "buy","false","1.000000","853.000000",
+                "26518313","1100000005897931","2022-02-09T10:20:43"]],
+    },
   };
+
+  // Detect if a template is a broker format
+  const isBrokerTemplate = (type) => TEMPLATES[type]?.brokerFormat === true;
+
+  // Auto-detect template from uploaded CSV headers
+  function detectBrokerTemplate(headers) {
+    const lower = headers.map(h => h.toLowerCase().trim());
+    // ZERODHA_TRADEBOOK_V2 signature: has trade_date + trade_type + trade_id
+    if (lower.includes("trade_date") && lower.includes("trade_type") && lower.includes("trade_id")) {
+      return "zerodha_v2";
+    }
+    return null;
+  }
 
   function downloadTemplate(type) {
     const t = TEMPLATES[type];
     const csv = [t.cols.join(","), ...t.sample.map(r=>r.join(","))].join("\n");
     const blob = new Blob([csv], {type:"text/csv"});
     const a = document.createElement("a"); a.href=URL.createObjectURL(blob);
-    a.download=`wealthmap_${type}_template.csv`; a.click();
+    // Use a descriptive filename for broker templates
+    const filename = type === "zerodha_v2"
+      ? "zerodha_tradebook_v2_sample.csv"
+      : `wealthmap_${type}_template.csv`;
+    a.download = filename; a.click();
     toast("Template downloaded");
   }
 
   async function handleFile(file) {
     if (!file) return;
-    setFileName(file.name); setLoading(true); setRows([]); setErrors([]);
+    setFileName(file.name); setLoading(true); setRows([]); setErrors([]); setImportResult(null);
     try {
       let csvText = "";
       if (file.name.endsWith(".csv") || file.name.endsWith(".txt")) {
         csvText = await file.text();
       } else if (file.name.endsWith(".xlsx") || file.name.endsWith(".xls")) {
-        // Use SheetJS via CDN fallback
         const buf = await file.arrayBuffer();
         const XLSX = window.XLSX;
         if (!XLSX) { setErrors(["XLSX support requires SheetJS. Please use CSV format."]); setLoading(false); return; }
@@ -3428,117 +3501,287 @@ function ImportModal({ state, dispatch, onClose }) {
         setErrors(["Unsupported file type. Use .csv, .xlsx, or .xls"]);
         setLoading(false); return;
       }
-      parseCSV(csvText);
+      // Auto-detect broker template from headers before parsing
+      const firstLine = csvText.trim().split(/\r?\n/)[0];
+      const headers   = firstLine.split(",").map(h => h.trim().replace(/^["']|["']$/g,""));
+      const detected  = detectBrokerTemplate(headers);
+      if (detected && importType !== detected) {
+        setImportType(detected);
+        // Parse with the detected type (parseCSV reads importType via closure, so
+        // we pass the override explicitly)
+        parseCSV(csvText, detected);
+      } else {
+        parseCSV(csvText, importType);
+      }
     } catch(e) {
       setErrors(["Failed to read file: " + e.message]);
     }
     setLoading(false);
   }
 
-  function parseCSV(text) {
+  // parseCSV: parse raw CSV text and validate rows.
+  // activeType: the importType to use (passed explicitly to handle auto-detection).
+  function parseCSV(text, activeType) {
+    const type  = activeType || importType;
+    const tmpl  = TEMPLATES[type];
     const lines = text.trim().split(/\r?\n/).filter(Boolean);
     if (lines.length < 2) { setErrors(["File is empty or has only headers"]); return; }
-    const headers = lines[0].split(",").map(h=>h.trim().replace(/^["']|["']$/g,""));
-    const expected = TEMPLATES[importType].cols;
-    const missing = expected.filter(col => !headers.some(h=>h.toLowerCase()===col.toLowerCase()));
-    if (missing.length>0) { setErrors([`Missing columns: ${missing.join(", ")}`]); return; }
 
-    const errs=[]; const parsed=[];
-    lines.slice(1).forEach((line,i) => {
-      const vals = line.split(",").map(v=>v.trim().replace(/^["']|["']$/g,""));
-      const row = {};
-      headers.forEach((h,j) => row[h.toLowerCase()] = vals[j]||"");
-      // Validate
-      if (!row.date||isNaN(Date.parse(row.date))) errs.push(`Row ${i+2}: invalid date "${row.date}"`);
-      if (importType!=="trade") {
-        if (!row.amount||isNaN(parseFloat(row.amount))) errs.push(`Row ${i+2}: invalid amount "${row.amount}"`);
-      } else {
-        if (!row.quantity||isNaN(parseFloat(row.quantity))) errs.push(`Row ${i+2}: invalid quantity`);
-        if (!row.price||isNaN(parseFloat(row.price))) errs.push(`Row ${i+2}: invalid price`);
-        if (!["buy","sell"].includes((row.type||"").toLowerCase())) errs.push(`Row ${i+2}: type must be buy or sell`);
+    const headers = lines[0].split(",").map(h => h.trim().replace(/^["']|["']$/g,""));
+
+    if (tmpl.brokerFormat) {
+      // ── Broker template validation ────────────────────────────────────────
+      // Only validate that the mapped (non-ignored) source columns exist.
+      const mappedCsvCols = Object.keys(tmpl.colMap);
+      const missing = mappedCsvCols.filter(
+        col => !headers.some(h => h.toLowerCase() === col.toLowerCase())
+      );
+      if (missing.length > 0) {
+        setErrors([`Missing required columns for ${tmpl.label}: ${missing.join(", ")}`]);
+        return;
       }
-      parsed.push(row);
-    });
-    setErrors(errs);
-    setRows(parsed);
+
+      const errs = []; const parsed = [];
+      lines.slice(1).forEach((line, i) => {
+        const vals = line.split(",").map(v => v.trim().replace(/^["']|["']$/g,""));
+        const raw  = {};
+        headers.forEach((h, j) => { raw[h.toLowerCase().trim()] = vals[j] || ""; });
+
+        // Map CSV columns → internal field names via colMap
+        const row = { _brokerType: type };
+        Object.entries(tmpl.colMap).forEach(([csvCol, internalField]) => {
+          row[internalField] = raw[csvCol.toLowerCase()] || "";
+        });
+        // Always store the external trade_id raw value for dedup
+        if (tmpl.externalIdCol) {
+          row._externalId = raw[tmpl.externalIdCol.toLowerCase()] || "";
+        }
+
+        // Validate required broker fields
+        const tradeDate = row.trade_date || "";
+        const tradeType = (row.trade_type || "").toLowerCase();
+        const qty       = parseFloat(row.quantity);
+        const price     = parseFloat(row.price);
+
+        if (!tradeDate || isNaN(Date.parse(tradeDate)))
+          errs.push("Row " + (i+2) + ": invalid trade_date "" + tradeDate + """);
+        if (!["buy","sell"].includes(tradeType))
+          errs.push("Row " + (i+2) + ": trade_type must be buy or sell, got "" + row.trade_type + """);
+        if (isNaN(qty) || qty <= 0)
+          errs.push("Row " + (i+2) + ": invalid quantity "" + row.quantity + """);
+        if (isNaN(price) || price <= 0)
+          errs.push("Row " + (i+2) + ": invalid price "" + row.price + """);
+        if (!row.stock_name)
+          errs.push("Row " + (i+2) + ": missing symbol");
+
+        parsed.push(row);
+      });
+      setErrors(errs);
+      setRows(parsed);
+
+    } else {
+      // ── Standard (native) template validation ─────────────────────────────
+      const expected = tmpl.cols;
+      const missing  = expected.filter(
+        col => !headers.some(h => h.toLowerCase() === col.toLowerCase())
+      );
+      if (missing.length > 0) { setErrors(["Missing columns: " + missing.join(", ")]); return; }
+
+      const errs = []; const parsed = [];
+      lines.slice(1).forEach((line, i) => {
+        const vals = line.split(",").map(v => v.trim().replace(/^["']|["']$/g,""));
+        const row  = {};
+        headers.forEach((h, j) => row[h.toLowerCase()] = vals[j] || "");
+        if (!row.date || isNaN(Date.parse(row.date)))
+          errs.push("Row " + (i+2) + ": invalid date "" + row.date + """);
+        if (type !== "trade") {
+          if (!row.amount || isNaN(parseFloat(row.amount)))
+            errs.push("Row " + (i+2) + ": invalid amount "" + row.amount + """);
+        } else {
+          if (!row.quantity || isNaN(parseFloat(row.quantity)))
+            errs.push("Row " + (i+2) + ": invalid quantity");
+          if (!row.price || isNaN(parseFloat(row.price)))
+            errs.push("Row " + (i+2) + ": invalid price");
+          if (!["buy","sell"].includes((row.type||"").toLowerCase()))
+            errs.push("Row " + (i+2) + ": type must be buy or sell");
+        }
+        parsed.push(row);
+      });
+      setErrors(errs);
+      setRows(parsed);
+    }
   }
 
   function doImport() {
-    const accounts = state?.accounts||[];
-    const expCats  = state?.expenseCategories||DEFAULT.expenseCategories;
-    const incCats  = state?.incomeCategories ||DEFAULT.incomeCategories;
-    const accTypes = state?.accountCategories||DEFAULT.accountCategories;
+    const accounts   = state?.accounts||[];
+    const expCats    = state?.expenseCategories||DEFAULT.expenseCategories;
+    const incCats    = state?.incomeCategories ||DEFAULT.incomeCategories;
+    const accTypes   = state?.accountCategories||DEFAULT.accountCategories;
     const investType = accTypes.find(t=>t.isInvestmentType);
-    let count=0, skipped=0;
+    let imported=0, skipped=0, errCount=0;
+    const total = rows.length;
 
-    // ── Dedup helpers ──────────────────────────────────────────────────────
-    // Build fingerprints of existing records to skip exact duplicates
+    // ── Dedup: fingerprints for native format ────────────────────────────────
     const existingTxFingerprints = new Set(
       (state?.transactions||[]).map(t =>
-        `${t.type}|${t.date}|${t.amount}|${t.accountId}|${t.categoryId}`
+        t.type+"|"+t.date+"|"+t.amount+"|"+t.accountId+"|"+t.categoryId
       )
     );
     const existingTradeFingerprints = new Set(
       (state?.investmentTx||[]).map(t =>
-        `${t.type}|${t.date}|${t.symbol}|${t.quantity}|${t.price}|${t.accountId}`
+        t.type+"|"+t.date+"|"+(t.symbol||"").toUpperCase()+"|"+t.quantity+"|"+t.price+"|"+t.accountId
       )
+    );
+    // ── Dedup: external trade IDs for broker formats ─────────────────────────
+    const existingExternalIds = new Set(
+      (state?.investmentTx||[])
+        .filter(t => t.externalTradeId)
+        .map(t => String(t.externalTradeId))
     );
 
     rows.forEach(row => {
-      if (importType==="expense"||importType==="income") {
-        const cats   = importType==="expense" ? expCats : incCats;
-        const catObj = cats.find(c=>c.name.toLowerCase()===row.category?.toLowerCase());
-        const acc    = accounts.find(a=>a.name.toLowerCase()===row.account?.toLowerCase());
-        const fp = `${importType}|${row.date}|${parseFloat(row.amount)||0}|${acc?.id||""}|${catObj?.id||""}`;
-        if (existingTxFingerprints.has(fp)) { skipped++; return; }
-        const tx = {
-          id: uid(), type: importType,
-          amount: parseFloat(row.amount)||0,
-          currency: acc?.currency||"INR",
-          categoryId: catObj?.id||cats[0]?.id||"",
-          accountId:  acc?.id||accounts[0]?.id||"",
-          note: row.note||"",
-          date: row.date,
-          tags: [],
-          isRefunded: false, refundedAmount: 0,
-        };
-        dispatch({type:"ADD_TX",payload:tx});
-        existingTxFingerprints.add(fp); // prevent intra-batch dupes too
-        count++;
-      } else if (importType==="trade") {
-        const invAcc = accounts.find(a=>a.name.toLowerCase()===(row.investmentaccount||"").toLowerCase());
-        const srcAcc = accounts.find(a=>a.name.toLowerCase()===(row.sourceaccount||"").toLowerCase());
-        const sym    = (row.symbol||"").toUpperCase();
-        const tradeType = row.type?.toLowerCase()||"buy";
-        const qty    = parseFloat(row.quantity)||0;
-        const price  = parseFloat(row.price)||0;
-        const fp = `${tradeType}|${row.date}|${sym}|${qty}|${price}|${invAcc?.id||""}`;
-        if (existingTradeFingerprints.has(fp)) { skipped++; return; }
-        const holdingId = uid();
-        const itx = {
-          id:uid(), holdingId, type: tradeType,
-          invType:"stock", symbol:sym, name:sym,
-          quantity: qty, price, currency: invAcc?.currency||"INR",
-          date: row.date,
-          accountId: invAcc?.id||accounts[0]?.id||"",
-          sourceAccountId: srcAcc?.id||"",
-          brokerage:0, note: row.note||"",
-        };
-        const newHolding = tradeType==="buy" ? {
-          id:holdingId,symbol:sym,name:sym,type:"stock",
-          accountId:itx.accountId,currency:itx.currency,
-          lots:[],quantity:0,units:0,avgPrice:0,investedAmount:0,
-        } : null;
-        dispatch({type:"ADD_INVESTMENT",payload:{itx,newHolding,isFD:false}});
-        existingTradeFingerprints.add(fp); // prevent intra-batch dupes too
-        count++;
+
+      // ════════════════════════════════════════════════════════════════════
+      // BROKER FORMAT: zerodha_v2 (and any future broker templates)
+      // ════════════════════════════════════════════════════════════════════
+      if (row._brokerType && TEMPLATES[row._brokerType]?.brokerFormat) {
+        try {
+          const sym        = (row.stock_name || "").toUpperCase().trim();
+          const tradeType  = (row.trade_type || "").toLowerCase().trim();   // buy | sell
+          const qty        = parseFloat(row.quantity);
+          const price      = parseFloat(row.price);
+          const tradeDate  = row.trade_date || "";     // YYYY-MM-DD (Zerodha format)
+          const extId      = row._externalId || "";    // trade_id from CSV
+
+          // Skip if any required field is missing/invalid
+          if (!sym || !tradeDate || isNaN(qty) || isNaN(price) || !["buy","sell"].includes(tradeType)) {
+            errCount++; return;
+          }
+
+          // ── Dedup by external trade_id ─────────────────────────────────
+          if (extId && existingExternalIds.has(extId)) { skipped++; return; }
+
+          // ── Resolve investment account (first investment-type account, else first account) ──
+          const invAcc = investType
+            ? accounts.find(a => a.categoryId === investType.id && !a.disabled)
+            : null;
+          const invAccId = invAcc?.id || accounts[0]?.id || "";
+          const currency = invAcc?.currency || "INR";
+
+          // ── Build trade object ─────────────────────────────────────────
+          const holdingId = uid();
+          const itx = {
+            id:              uid(),
+            holdingId,
+            type:            tradeType,           // "buy" | "sell"
+            invType:         "stock",
+            symbol:          sym,
+            name:            sym,                 // name = symbol; user can rename later
+            quantity:        qty,
+            price,
+            currency,
+            date:            tradeDate,           // YYYY-MM-DD — system date format
+            accountId:       invAccId,
+            sourceAccountId: "",                  // not in Zerodha tradebook; user can link later
+            brokerage:       0,
+            note:            row.exchange ? "Exchange: " + row.exchange : "",
+            externalTradeId: extId,               // store for future dedup
+          };
+
+          const newHolding = tradeType === "buy" ? {
+            id:             holdingId,
+            symbol:         sym,
+            name:           sym,
+            type:           "stock",
+            accountId:      invAccId,
+            currency,
+            lots:           [],
+            quantity:       0,
+            units:          0,
+            avgPrice:       0,
+            investedAmount: 0,
+          } : null;
+
+          dispatch({ type:"ADD_INVESTMENT", payload:{ itx, newHolding, isFD:false } });
+
+          // Track to prevent intra-batch duplicate external IDs
+          if (extId) existingExternalIds.add(extId);
+          imported++;
+
+        } catch(e) {
+          console.warn("Broker import row error:", e);
+          errCount++;
+        }
+        return; // done with this broker row
+      }
+
+      // ════════════════════════════════════════════════════════════════════
+      // STANDARD (native) FORMAT: expense, income, trade
+      // ════════════════════════════════════════════════════════════════════
+      try {
+        if (importType==="expense"||importType==="income") {
+          const cats   = importType==="expense" ? expCats : incCats;
+          const catObj = cats.find(c=>c.name.toLowerCase()===row.category?.toLowerCase());
+          const acc    = accounts.find(a=>a.name.toLowerCase()===row.account?.toLowerCase());
+          const fp     = importType+"|"+row.date+"|"+(parseFloat(row.amount)||0)+"|"+(acc?.id||"")+"|"+(catObj?.id||"");
+          if (existingTxFingerprints.has(fp)) { skipped++; return; }
+          const tx = {
+            id: uid(), type: importType,
+            amount:     parseFloat(row.amount)||0,
+            currency:   acc?.currency||"INR",
+            categoryId: catObj?.id||cats[0]?.id||"",
+            accountId:  acc?.id||accounts[0]?.id||"",
+            note:       row.note||"",
+            date:       row.date,
+            tags:       [],
+            isRefunded: false, refundedAmount: 0,
+          };
+          dispatch({type:"ADD_TX",payload:tx});
+          existingTxFingerprints.add(fp);
+          imported++;
+
+        } else if (importType==="trade") {
+          const invAcc    = accounts.find(a=>a.name.toLowerCase()===(row.investmentaccount||"").toLowerCase());
+          const srcAcc    = accounts.find(a=>a.name.toLowerCase()===(row.sourceaccount||"").toLowerCase());
+          const sym       = (row.symbol||"").toUpperCase();
+          const tradeType = row.type?.toLowerCase()||"buy";
+          const qty       = parseFloat(row.quantity)||0;
+          const price     = parseFloat(row.price)||0;
+          const fp        = tradeType+"|"+row.date+"|"+sym+"|"+qty+"|"+price+"|"+(invAcc?.id||"");
+          if (existingTradeFingerprints.has(fp)) { skipped++; return; }
+          const holdingId = uid();
+          const itx = {
+            id:uid(), holdingId, type: tradeType,
+            invType:"stock", symbol:sym, name:sym,
+            quantity: qty, price, currency: invAcc?.currency||"INR",
+            date: row.date,
+            accountId:      invAcc?.id||accounts[0]?.id||"",
+            sourceAccountId: srcAcc?.id||"",
+            brokerage:0, note: row.note||"",
+          };
+          const newHolding = tradeType==="buy" ? {
+            id:holdingId,symbol:sym,name:sym,type:"stock",
+            accountId:itx.accountId,currency:itx.currency,
+            lots:[],quantity:0,units:0,avgPrice:0,investedAmount:0,
+          } : null;
+          dispatch({type:"ADD_INVESTMENT",payload:{itx,newHolding,isFD:false}});
+          existingTradeFingerprints.add(fp);
+          imported++;
+        }
+      } catch(e) {
+        console.warn("Import row error:", e);
+        errCount++;
       }
     });
-    const msg = skipped > 0
-      ? `${count} imported, ${skipped} duplicate(s) skipped`
-      : `${count} record(s) imported successfully`;
-    toast(msg);
-    onClose();
+
+    // ── Show result summary (don't auto-close so user can see it) ───────────
+    setImportResult({ total, imported, skipped, errors: errCount });
+    const parts = [
+      imported + " trade(s) imported",
+      skipped  > 0 ? skipped  + " duplicate(s) skipped" : null,
+      errCount > 0 ? errCount + " error(s)" : null,
+    ].filter(Boolean);
+    toast(parts.join(" · "), errCount > 0 ? "error" : "success");
   }
 
   return (
@@ -3546,22 +3789,57 @@ function ImportModal({ state, dispatch, onClose }) {
       {/* Type selector */}
       <div style={{display:"flex",gap:6,marginBottom:16,overflowX:"auto",paddingBottom:2}}>
         {[["expense","📤 Expenses"],["income","📥 Income"],["trade","📊 Trades"]].map(([v,l])=>(
-          <button key={v} onClick={()=>{setImportType(v);setRows([]);setErrors([]);setFileName("");}}
+          <button key={v} onClick={()=>{setImportType(v);setRows([]);setErrors([]);setFileName("");setImportResult(null);}}
             style={{flexShrink:0,padding:"7px 14px",borderRadius:18,border:`2px solid ${importType===v?"#6366F1":"#E2E8F0"}`,background:importType===v?"#EEF2FF":"#fff",color:importType===v?"#6366F1":"#64748B",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>{l}</button>
+        ))}
+        {/* Broker format templates */}
+        <div style={{width:"1px",background:"#E2E8F0",flexShrink:0,margin:"0 2px"}} />
+        {[["zerodha_v2","🟠 Zerodha"]].map(([v,l])=>(
+          <button key={v} onClick={()=>{setImportType(v);setRows([]);setErrors([]);setFileName("");setImportResult(null);}}
+            style={{flexShrink:0,padding:"7px 14px",borderRadius:18,border:`2px solid ${importType===v?"#F59E0B":"#E2E8F0"}`,background:importType===v?"#FFFBEB":"#fff",color:importType===v?"#92400E":"#64748B",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>{l}</button>
         ))}
       </div>
 
-      {/* Download template */}
-      <div style={{background:"#EEF2FF",border:"1.5px solid #C7D2FE",borderRadius:10,padding:12,marginBottom:16,fontSize:13}}>
-        <div style={{fontWeight:600,color:"#4338CA",marginBottom:6}}>📋 Required columns:</div>
-        <div style={{color:"#475569",fontFamily:"monospace",fontSize:12,marginBottom:8}}>
-          {TEMPLATES[importType].cols.join(" | ")}
+      {/* Template info box — adapts for broker formats */}
+      {isBrokerTemplate(importType) ? (
+        <div style={{background:"#FFFBEB",border:"1.5px solid #FDE68A",borderRadius:10,padding:12,marginBottom:16,fontSize:13}}>
+          <div style={{fontWeight:700,color:"#92400E",marginBottom:4}}>
+            🟠 {TEMPLATES[importType].label} — Broker CSV Format
+          </div>
+          <div style={{fontSize:11,color:"#78350F",marginBottom:6}}>
+            Auto-detected when you upload a Zerodha tradebook CSV.
+            Upload your file directly — no column renaming needed.
+          </div>
+          <div style={{fontWeight:600,color:"#92400E",marginBottom:4}}>Mapped columns:</div>
+          <div style={{color:"#78350F",fontFamily:"monospace",fontSize:11,marginBottom:8,lineHeight:1.8}}>
+            {Object.entries(TEMPLATES[importType].colMap).map(([csv,internal])=>(
+              <span key={csv} style={{display:"inline-block",marginRight:12}}>
+                <span style={{color:"#0F172A"}}>{csv}</span>
+                <span style={{color:"#94A3B8"}}> → </span>
+                <span style={{color:"#6366F1"}}>{internal}</span>
+              </span>
+            ))}
+          </div>
+          <div style={{fontSize:11,color:"#94A3B8",marginBottom:8}}>
+            Ignored: {TEMPLATES[importType].ignoredCols.join(", ")}
+          </div>
+          <button onClick={()=>downloadTemplate(importType)}
+            style={{fontSize:12,padding:"5px 12px",borderRadius:8,border:"1.5px solid #FDE68A",background:"#fff",color:"#92400E",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+            ⬇️ Download Sample CSV
+          </button>
         </div>
-        <button onClick={()=>downloadTemplate(importType)}
-          style={{fontSize:12,padding:"5px 12px",borderRadius:8,border:"1.5px solid #C7D2FE",background:"#fff",color:"#6366F1",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
-          ⬇️ Download Template
-        </button>
-      </div>
+      ) : (
+        <div style={{background:"#EEF2FF",border:"1.5px solid #C7D2FE",borderRadius:10,padding:12,marginBottom:16,fontSize:13}}>
+          <div style={{fontWeight:600,color:"#4338CA",marginBottom:6}}>📋 Required columns:</div>
+          <div style={{color:"#475569",fontFamily:"monospace",fontSize:12,marginBottom:8}}>
+            {TEMPLATES[importType].cols.join(" | ")}
+          </div>
+          <button onClick={()=>downloadTemplate(importType)}
+            style={{fontSize:12,padding:"5px 12px",borderRadius:8,border:"1.5px solid #C7D2FE",background:"#fff",color:"#6366F1",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+            ⬇️ Download Template
+          </button>
+        </div>
+      )}
 
       {/* File upload */}
       <input ref={fileRef} type="file" accept=".csv,.xlsx,.xls" style={{display:"none"}}
@@ -3579,51 +3857,108 @@ function ImportModal({ state, dispatch, onClose }) {
         </div>
       )}
 
-      {/* Preview */}
-      {rows.length>0&&errors.length===0&&(()=>{
-        // Calculate duplicates ahead of time for preview
-        const existingTxFP = new Set((state?.transactions||[]).map(t=>`${t.type}|${t.date}|${t.amount}|${t.accountId}|${t.categoryId}`));
-        const existingTradeFP = new Set((state?.investmentTx||[]).map(t=>`${t.type}|${t.date}|${(t.symbol||"").toUpperCase()}|${t.quantity}|${t.price}|${t.accountId}`));
-        const accounts = state?.accounts||[];
-        const expCats = state?.expenseCategories||DEFAULT.expenseCategories;
-        const incCats = state?.incomeCategories||DEFAULT.incomeCategories;
-        let dupCount = 0;
+      {/* Preview — shows before import */}
+      {rows.length>0&&errors.length===0&&!importResult&&(()=>{
+        // Pre-calculate duplicate count for preview
+        const existingTxFP = new Set(
+          (state?.transactions||[]).map(t=>t.type+"|"+t.date+"|"+t.amount+"|"+t.accountId+"|"+t.categoryId)
+        );
+        const existingTradeFP = new Set(
+          (state?.investmentTx||[]).map(t=>t.type+"|"+t.date+"|"+(t.symbol||"").toUpperCase()+"|"+t.quantity+"|"+t.price+"|"+t.accountId)
+        );
+        const existingExtIds = new Set(
+          (state?.investmentTx||[]).filter(t=>t.externalTradeId).map(t=>String(t.externalTradeId))
+        );
+        const accts    = state?.accounts||[];
+        const expCats  = state?.expenseCategories||DEFAULT.expenseCategories;
+        const incCats  = state?.incomeCategories||DEFAULT.incomeCategories;
+        let dupCount   = 0;
+
         rows.forEach(row => {
-          if (importType==="expense"||importType==="income") {
-            const cats = importType==="expense"?expCats:incCats;
+          if (row._brokerType && TEMPLATES[row._brokerType]?.brokerFormat) {
+            // Broker dedup: by external trade_id
+            if (row._externalId && existingExtIds.has(row._externalId)) dupCount++;
+          } else if (importType==="expense"||importType==="income") {
+            const cats   = importType==="expense"?expCats:incCats;
             const catObj = cats.find(c=>c.name.toLowerCase()===row.category?.toLowerCase());
-            const acc = accounts.find(a=>a.name.toLowerCase()===row.account?.toLowerCase());
-            const fp = `${importType}|${row.date}|${parseFloat(row.amount)||0}|${acc?.id||""}|${catObj?.id||""}`;
+            const acc    = accts.find(a=>a.name.toLowerCase()===row.account?.toLowerCase());
+            const fp     = importType+"|"+row.date+"|"+(parseFloat(row.amount)||0)+"|"+(acc?.id||"")+"|"+(catObj?.id||"");
             if (existingTxFP.has(fp)) dupCount++;
           } else if (importType==="trade") {
-            const invAcc = accounts.find(a=>a.name.toLowerCase()===(row.investmentaccount||"").toLowerCase());
-            const sym = (row.symbol||"").toUpperCase();
-            const fp = `${row.type?.toLowerCase()||"buy"}|${row.date}|${sym}|${parseFloat(row.quantity)||0}|${parseFloat(row.price)||0}|${invAcc?.id||""}`;
+            const invAcc = accts.find(a=>a.name.toLowerCase()===(row.investmentaccount||"").toLowerCase());
+            const sym    = (row.symbol||"").toUpperCase();
+            const fp     = (row.type?.toLowerCase()||"buy")+"|"+row.date+"|"+sym+"|"+(parseFloat(row.quantity)||0)+"|"+(parseFloat(row.price)||0)+"|"+(invAcc?.id||"");
             if (existingTradeFP.has(fp)) dupCount++;
           }
         });
+
         const newCount = rows.length - dupCount;
+
+        // For broker rows, show mapped fields; for native, show raw values
+        const previewRows = rows.slice(0, 5).map((r, i) => {
+          if (r._brokerType) {
+            const sym   = (r.stock_name||"—").toUpperCase();
+            const type  = (r.trade_type||"").toUpperCase();
+            const qty   = parseFloat(r.quantity)||0;
+            const price = parseFloat(r.price)||0;
+            const date  = r.trade_date||"";
+            const extId = r._externalId||"";
+            return sym + "  " + type + "  " + qty + " @ ₹" + price + "  " + date + "  [id:" + extId + "]";
+          }
+          return Object.entries(r).filter(([k])=>!k.startsWith("_")).map(([,v])=>v).join(" | ");
+        });
+
         return (
           <div style={{marginBottom:12}}>
-            <div style={{display:"flex",gap:8,marginBottom:8,flexWrap:"wrap"}}>
-              <div style={{fontWeight:600,fontSize:13,color:"#10B981"}}>✅ {newCount} new record(s) to import</div>
+            <div style={{display:"flex",gap:8,marginBottom:8,flexWrap:"wrap",alignItems:"center"}}>
+              <div style={{fontWeight:700,fontSize:13,color:"#10B981"}}>✅ {newCount} new record(s) ready</div>
               {dupCount>0&&<div style={{fontWeight:600,fontSize:13,color:"#F59E0B"}}>⚠️ {dupCount} duplicate(s) will be skipped</div>}
             </div>
-            <div style={{maxHeight:160,overflowY:"auto",fontSize:12,background:"#F8FAFC",borderRadius:8,padding:8}}>
-              {rows.slice(0,5).map((r,i)=>(
-                <div key={i} style={{color:"#475569",padding:"2px 0",fontFamily:"monospace"}}>{Object.values(r).join(" | ")}</div>
+            <div style={{maxHeight:160,overflowY:"auto",fontSize:11,background:"#F8FAFC",borderRadius:8,padding:8}}>
+              {previewRows.map((line,i)=>(
+                <div key={i} style={{color:"#475569",padding:"2px 0",fontFamily:"monospace",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{line}</div>
               ))}
-              {rows.length>5&&<div style={{color:"#94A3B8"}}>…and {rows.length-5} more</div>}
+              {rows.length>5&&<div style={{color:"#94A3B8",fontSize:11,marginTop:4}}>…and {rows.length-5} more rows</div>}
             </div>
           </div>
         );
       })()}
 
+      {/* Import Result Summary — shows after import */}
+      {importResult&&(
+        <div style={{background:"#F0FDF4",border:"1.5px solid #A7F3D0",borderRadius:10,padding:14,marginBottom:12}}>
+          <div style={{fontWeight:700,fontSize:14,color:"#065F46",marginBottom:10}}>✅ Import Complete</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:8}}>
+            {[
+              {label:"Total Rows",    val:importResult.total,    color:"#0F172A",  bg:"#F8FAFC"},
+              {label:"Imported",      val:importResult.imported, color:"#10B981",  bg:"#ECFDF5"},
+              {label:"Skipped (dup)", val:importResult.skipped,  color:"#F59E0B",  bg:"#FFFBEB"},
+              {label:"Errors",        val:importResult.errors,   color:importResult.errors>0?"#EF4444":"#94A3B8", bg:importResult.errors>0?"#FEF2F2":"#F8FAFC"},
+            ].map(s=>(
+              <div key={s.label} style={{background:s.bg,borderRadius:8,padding:"10px 12px",textAlign:"center"}}>
+                <div style={{fontWeight:800,fontSize:22,color:s.color}}>{s.val}</div>
+                <div style={{fontSize:11,color:"#64748B",marginTop:2}}>{s.label}</div>
+              </div>
+            ))}
+          </div>
+          {importResult.errors>0&&(
+            <div style={{marginTop:8,fontSize:12,color:"#92400E"}}>
+              ⚠️ {importResult.errors} row(s) had errors and were skipped. Check the console for details.
+            </div>
+          )}
+        </div>
+      )}
+
       <BtnRow>
-        <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-        <Btn onClick={doImport} disabled={rows.length===0||errors.length>0}>
-          Import {rows.length>0?`${rows.length} Records`:""}
-        </Btn>
+        <Btn variant="ghost" onClick={onClose}>{importResult ? "Close" : "Cancel"}</Btn>
+        {!importResult && (
+          <Btn onClick={doImport} disabled={rows.length===0||errors.length>0}>
+            Import {rows.length>0 ? rows.length+" Records" : ""}
+          </Btn>
+        )}
+        {importResult && importResult.imported > 0 && (
+          <Btn variant="success" onClick={onClose}>✅ Done</Btn>
+        )}
       </BtnRow>
     </Modal>
   );
