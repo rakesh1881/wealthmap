@@ -1,26 +1,12 @@
 // ============================================================
-// WEALTHMAP v5.1
-// Changes vs v5 (surgical modifications only):
-//
-//  1. FAB "+" button — removed from header, now fixed bottom-right
-//     (desktop) / centered bottom (mobile). Thumb-friendly, never
-//     overlaps content or bottom nav.
-//
-//  2. Dynamic Account Types — accountCategories fully user-managed:
-//     create / edit / delete in Profile → Account Types.
-//     isCreditCardType flag on category drives CC billing logic.
-//     Delete blocked if any account uses the type.
-//
-//  3. Two-step account selection in Expense/Income modal:
-//     Step 1 → pick Account Type (user-defined list)
-//     Step 2 → pick Account filtered to that type only.
-//
-//  4. Category + optional Sub-category:
-//     - subCategories[] array on each expense/income category.
-//     - Sub-category selector appears only when parent has subs.
-//     - subCategoryId stored on transaction (null when unused).
-//     - TxCatModal: add/remove sub-categories per parent.
-//     - TxRow and Reports display sub-category label when set.
+// WEALTHMAP v11 — FIFO Profits, Holdings Fix, Bulk Delete
+// Changes vs v10:
+//  1.  Holdings: net quantity only (FIFO sells reduce remaining lots)
+//  2.  FIFO realized P&L tracked per sell lot-match
+//  3.  Profits tab: per-sell P&L rows + net realized total
+//  4.  Trade History: multi-select checkboxes + bulk delete
+//  5.  FD close: principal + interest both credited (not just interest)
+//  6.  P&L Report: closed (sold) trades only, FIFO-matched cost basis
 // ============================================================
 
 import { useState, useEffect, useReducer, useRef, useMemo, useCallback } from "react";
@@ -30,7 +16,7 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = "https://hqkqhgrfcwixqoehjfaj.supabase.co";
 const SUPABASE_KEY = "sb_publishable_N-ZcUkVL6fF-pch1sZPg6Q_hbd8sUPv";
 const supabase     = createClient(SUPABASE_URL, SUPABASE_KEY);
-const STORAGE_KEY  = "wealthmap_v5";
+const STORAGE_KEY  = "wealthmap_v11";
 
 // ─── CURRENCIES ───────────────────────────────────────────────────────────────
 const CURRENCIES = [
@@ -63,7 +49,8 @@ const DEFAULT = {
     { id:"cat_wallet", name:"Wallet / UPI", icon:"📱", color:"#F59E0B", isCreditCardType:false },
     { id:"cat_broker", name:"Stock Broker", icon:"📈", color:"#8B5CF6", isCreditCardType:false },
     { id:"cat_mf",     name:"Mutual Funds", icon:"📊", color:"#06B6D4", isCreditCardType:false },
-    { id:"cat_other",  name:"Other",        icon:"🏷️", color:"#6B7280", isCreditCardType:false },
+    { id:"cat_invest",  name:"Investment",   icon:"📈", color:"#6366F1", isCreditCardType:false, isInvestmentType:true },
+    { id:"cat_other",   name:"Other",        icon:"🏷️", color:"#6B7280", isCreditCardType:false },
   ],
   expenseCategories: [
     { id:"ec_food",  name:"Food & Dining",    icon:"🍽️" },
@@ -86,25 +73,71 @@ const DEFAULT = {
     { id:"ic_ref",  name:"Refund Received",icon:"↩️" },
     { id:"ic_other",name:"Other",          icon:"🏷️" },
   ],
-  transactions: [],
-  holdings:     [],
-  investmentTx: [],
+  transactions:        [],
+  holdings:            [],
+  investmentTx:        [],
+  fixedDeposits:       [],
+  // ── NEW in v9: Stocks Master Table ──────────────────────────────────────────
+  // stocks: [{ id, symbol, name, type:"stock"|"mf", exchange }]
+  // Trades must reference a stock from this table (by symbol).
+  stocks:              [],
+  // ── NEW in v7 ──────────────────────────────────────────────────────────────
+  // marketPrices: { [symbol]: { current_price, last_updated } }
+  // Used for current value of holdings; separate from trade prices.
+  marketPrices:        {},
+  // corporateActions: array of { id, symbol, action_type, ratio, date, note }
+  // Supported: stock_split, bonus, reverse_split, dividend, stock_name_change
+  corporateActions:    [],
+  // tradeBalanceEffects: synthetic ledger entries for buy/sell balance changes
+  // { id, accountId, amount, sign: 1|-1, tradeId, date }
+  tradeBalanceEffects: [],
   fxRates: { USD:83.5, EUR:91.2, GBP:106.5, JPY:0.56, SGD:62.1, AED:22.7, HKD:10.7, CHF:94.3, AUD:54.8 },
 };
 
 // ─── SANITIZE ─────────────────────────────────────────────────────────────────
+// Also normalizes legacy account fields for backward compatibility:
+//   disabled → is_active (inverted), includeInNetWorth → include_in_networth
+function sanitizeAccount(a) {
+  if (!a || typeof a !== "object") return a;
+  const out = { ...a };
+  // Normalize is_active from legacy `disabled` field
+  if (out.is_active === undefined) {
+    out.is_active = out.disabled === true ? false : true;
+  }
+  // Keep disabled in sync for backward compat
+  out.disabled = !out.is_active;
+  // Normalize include_in_networth
+  if (out.include_in_networth === undefined) {
+    out.include_in_networth = out.includeInNetWorth !== undefined ? out.includeInNetWorth : true;
+  }
+  out.includeInNetWorth = out.include_in_networth; // keep both in sync
+  // Normalize account_type from legacy categoryId
+  if (out.account_type === undefined && out.categoryId !== undefined) {
+    out.account_type = out.categoryId;
+  }
+  if (out.categoryId === undefined && out.account_type !== undefined) {
+    out.categoryId = out.account_type;
+  }
+  return out;
+}
+
 function sanitize(raw) {
   if (!raw || typeof raw !== "object") return { ...DEFAULT };
   return {
-    accounts:          Array.isArray(raw.accounts)          ? raw.accounts          : [],
-    accountCategories: Array.isArray(raw.accountCategories) ? raw.accountCategories
-                     : Array.isArray(raw.categories)        ? raw.categories        : DEFAULT.accountCategories,
-    expenseCategories: Array.isArray(raw.expenseCategories) ? raw.expenseCategories : DEFAULT.expenseCategories,
-    incomeCategories:  Array.isArray(raw.incomeCategories)  ? raw.incomeCategories  : DEFAULT.incomeCategories,
-    transactions:      Array.isArray(raw.transactions)      ? raw.transactions      : [],
-    holdings:          Array.isArray(raw.holdings)          ? raw.holdings          : [],
-    investmentTx:      Array.isArray(raw.investmentTx)      ? raw.investmentTx      : [],
-    fxRates: (raw.fxRates && typeof raw.fxRates === "object") ? raw.fxRates         : DEFAULT.fxRates,
+    accounts:            Array.isArray(raw.accounts)            ? raw.accounts.map(sanitizeAccount) : [],
+    accountCategories:   Array.isArray(raw.accountCategories)   ? raw.accountCategories
+                       : Array.isArray(raw.categories)          ? raw.categories : DEFAULT.accountCategories,
+    expenseCategories:   Array.isArray(raw.expenseCategories)   ? raw.expenseCategories  : DEFAULT.expenseCategories,
+    incomeCategories:    Array.isArray(raw.incomeCategories)     ? raw.incomeCategories   : DEFAULT.incomeCategories,
+    transactions:        Array.isArray(raw.transactions)         ? raw.transactions        : [],
+    holdings:            Array.isArray(raw.holdings)             ? raw.holdings            : [],
+    investmentTx:        Array.isArray(raw.investmentTx)         ? raw.investmentTx        : [],
+    fxRates:           (raw.fxRates && typeof raw.fxRates === "object") ? raw.fxRates    : DEFAULT.fxRates,
+    fixedDeposits:       Array.isArray(raw.fixedDeposits)        ? raw.fixedDeposits       : [],
+    marketPrices:       (raw.marketPrices && typeof raw.marketPrices === "object") ? raw.marketPrices : {},
+    corporateActions:    Array.isArray(raw.corporateActions)     ? raw.corporateActions    : [],
+    tradeBalanceEffects: Array.isArray(raw.tradeBalanceEffects)  ? raw.tradeBalanceEffects : [],
+    stocks:              Array.isArray(raw.stocks)               ? raw.stocks              : [],
   };
 }
 
@@ -229,12 +262,13 @@ function calcCCBalance(acc, transactions) {
 
 // ─── BALANCE (regular accounts) ──────────────────────────────────────────────
 // For CC accounts, use calcCCBalance instead.
-// For regular accounts: openingBalance ± transaction effects.
-function calcBalance(accountId, transactions, accounts) {
+// For regular accounts: openingBalance ± transaction effects ± trade effects.
+// tradeBalanceEffects: buy → deduct from source; sell → credit to source.
+function calcBalance(accountId, transactions, accounts, tradeBalanceEffects) {
   const acc     = (accounts||[]).find(a => a.id === accountId);
   const opening = parseFloat(acc?.openingBalance) || 0;
 
-  return (transactions||[]).reduce((bal, tx) => {
+  const txBal = (transactions||[]).reduce((bal, tx) => {
     if (tx.type === "transfer") {
       if (tx.fromAccountId === accountId) return bal - (parseFloat(tx.amount)||0);
       if (tx.toAccountId   === accountId) return bal + (parseFloat(tx.amount)||0);
@@ -248,24 +282,70 @@ function calcBalance(accountId, transactions, accounts) {
     }
     return bal;
   }, opening);
+
+  // Add trade balance effects (buy deducts from source, sell credits source)
+  const tradeBal = (tradeBalanceEffects||[]).reduce((bal, eff) => {
+    if (eff.accountId === accountId) return bal + eff.amount * eff.sign;
+    return bal;
+  }, 0);
+
+  return txBal + tradeBal;
 }
 
-// ─── NET WORTH CALCULATOR ─────────────────────────────────────────────────────
-// Net Worth = assets (includeInNetWorth=true) − CC payable balances
-function calcNetWorth(accounts, transactions, fxRates) {
-  let assets = 0;
+// ─── NET WORTH CALCULATOR (CENTRALIZED SERVICE) ───────────────────────────────
+// Single source of truth — all views must use this function.
+// Net Worth = bank + cash + wallet + investment holdings (at market/invested value)
+//           + fixed deposits (at maturity value)
+//           − credit card payable balances
+// Investment accounts themselves are NOT added as a balance (they're tracked via holdings).
+//
+// @param accounts           - all accounts (will filter by include_in_networth / includeInNetWorth)
+// @param transactions       - all transactions
+// @param fxRates            - FX rates map
+// @param holdings           - computed holdings array
+// @param fixedDeposits      - FD array
+// @param marketPrices       - { [symbol]: { current_price } }
+// @param tradeBalanceEffects - trade balance deduction/credit effects
+function calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, marketPrices, tradeBalanceEffects) {
+  let assets   = 0;
   let ccPayable = 0;
+  const mp = marketPrices || {};
+  const eff = tradeBalanceEffects || [];
 
   accounts.forEach(acc => {
-    if (!acc.includeInNetWorth) return;
+    // Respect both legacy includeInNetWorth and new include_in_networth
+    const inNW = acc.include_in_networth !== undefined ? acc.include_in_networth : acc.includeInNetWorth;
+    if (!inNW) return;
+    // Check active status (both legacy `disabled` and new `is_active`)
+    const isActive = acc.is_active !== undefined ? acc.is_active : !acc.disabled;
+
     if (acc.isCreditCard) {
-      // CC payable is a liability
       const { payable, outstanding } = calcCCBalance(acc, transactions);
       ccPayable += toINR(payable + outstanding, acc.currency||"INR", fxRates);
+    } else if (acc.isInvestmentType || (acc.accountCategories && acc.accountCategories.find && false)) {
+      // Investment accounts: balance tracked via holdings, not direct balance
+      // Skip — holdings handled separately below
     } else {
-      const bal = calcBalance(acc.id, transactions, accounts);
+      const bal = calcBalance(acc.id, transactions, accounts, eff);
       assets += toINR(bal, acc.currency||"INR", fxRates);
     }
+  });
+
+  // Add investment holdings value (use market price if available, else invested value)
+  (holdings||[]).forEach(h => {
+    const marketPrice = mp[h.symbol]?.current_price;
+    const qty = h.quantity || h.units || 0;
+    const value = marketPrice
+      ? qty * marketPrice
+      : (h.investedAmount || qty * (h.avgPrice || h.nav || 0));
+    assets += toINR(value, h.currency||"INR", fxRates);
+  });
+
+  // Add fixed deposits at invested amount only (not maturity value)
+  // Interest is added manually by user as income when FD matures.
+  (fixedDeposits||[]).forEach(fd => {
+    const principal = parseFloat(fd.amount)||0;
+    assets += toINR(principal, fd.currency||"INR", fxRates);
   });
 
   return assets - ccPayable;
@@ -288,6 +368,316 @@ function calcCashbackSummary(transactions, accounts) {
   return summary;
 }
 
+// ─── FIFO INVESTMENT LOGIC ───────────────────────────────────────────────────
+// rebuildHoldings(investmentTx, existingHoldings)
+//   Returns: { holdings, realizedTrades }
+//
+// holdings: remaining open positions (net quantity after FIFO sells)
+//   • Each holding quantity = sum of remaining lot quantities
+//   • avgPrice = investedAmount / remaining quantity  (reflects only unsold cost)
+//
+// realizedTrades: one entry per FIFO lot-match on a sell
+//   { id, symbol, name, type, currency,
+//     sellTxId, sellDate, sellPrice,
+//     buyDate, buyPrice,
+//     qty, pnl, pnlPct }
+//
+// FIFO rule: oldest buy lot is consumed first on every sell.
+// Partial sells split the oldest lot — remaining qty stays in the lot.
+function rebuildHoldings(investmentTx, existingHoldings) {
+  const map = {};          // key → holding work object
+  const realized = [];     // accumulates realized P&L records
+
+  // Sort chronologically so lots are added in order
+  const sorted = [...investmentTx].sort((a,b) => new Date(a.date) - new Date(b.date));
+
+  sorted.forEach(tx => {
+    if (tx.invType === "fd") return; // FDs tracked separately
+    const sym = (tx.symbol || "").trim() || tx.holdingId || "unknown";
+    const key = `${sym}_${tx.accountId || ""}`;
+
+    if (!map[key]) {
+      const existing = existingHoldings.find(h => h.id === tx.holdingId);
+      map[key] = {
+        id:             tx.holdingId,
+        symbol:         tx.symbol   || existing?.symbol || "?",
+        name:           tx.name     || existing?.name   || tx.symbol || "?",
+        type:           tx.invType  || existing?.type   || "stock",
+        accountId:      tx.accountId,
+        currency:       tx.currency || existing?.currency || "INR",
+        lots:           [],   // remaining buy lots
+        investedAmount: 0,    // cost basis of remaining lots only
+      };
+    }
+
+    const h = map[key];
+
+    if (tx.type === "buy") {
+      const qty   = parseFloat(tx.quantity) || 0;
+      const price = parseFloat(tx.price)    || 0;
+      h.lots.push({ qty, price, date: tx.date, txId: tx.id });
+      h.investedAmount += qty * price;
+
+    } else if (tx.type === "sell") {
+      let remaining  = parseFloat(tx.quantity) || 0;
+      const sellPrice = parseFloat(tx.price)   || 0;
+
+      for (let i = 0; i < h.lots.length && remaining > 0; i++) {
+        const lot = h.lots[i];
+        if (lot.qty <= 0) continue;
+
+        const matchedQty = Math.min(lot.qty, remaining);
+        const costBasis  = lot.price;
+        const pnl        = (sellPrice - costBasis) * matchedQty;
+        const pnlPct     = costBasis > 0 ? ((sellPrice - costBasis) / costBasis) * 100 : 0;
+
+        // Record this FIFO lot-match as a realized trade
+        realized.push({
+          id:         `${tx.id}_${lot.txId || i}`,
+          symbol:     h.symbol,
+          name:       h.name,
+          type:       h.type,
+          currency:   h.currency,
+          sellTxId:   tx.id,
+          sellDate:   tx.date,
+          sellPrice,
+          buyDate:    lot.date,
+          buyPrice:   costBasis,
+          qty:        matchedQty,
+          pnl,
+          pnlPct,
+        });
+
+        // Reduce cost basis of remaining holding
+        h.investedAmount -= matchedQty * costBasis;
+        h.lots[i] = { ...lot, qty: lot.qty - matchedQty };
+        remaining -= matchedQty;
+      }
+      // Remove fully consumed lots
+      h.lots = h.lots.filter(l => l.qty > 0);
+    }
+  });
+
+  // Build final holdings — only positions with remaining quantity
+  const holdings = Object.values(map).map(h => {
+    const totalQty = h.lots.reduce((s, l) => s + l.qty, 0);
+    const invested  = Math.max(0, h.investedAmount);
+    const avgPrice  = totalQty > 0 ? invested / totalQty : 0;
+    return {
+      ...h,
+      quantity:       h.type !== "mf" ? totalQty : 0,
+      units:          h.type === "mf" ? totalQty : 0,
+      avgPrice,
+      nav:            h.type === "mf" ? avgPrice : 0,
+      investedAmount: invested,
+    };
+  }).filter(h => (h.quantity || 0) > 0 || (h.units || 0) > 0);
+
+  return { holdings, realizedTrades: realized };
+}
+
+// Convenience: just holdings (used by ADD_INVESTMENT incremental path)
+function rebuildHoldingsOnly(txList, existing) {
+  return rebuildHoldings(txList, existing).holdings;
+}
+
+// Pure realized-trades builder (used by Profits tab + P&L report)
+function buildRealizedTrades(investmentTx) {
+  return rebuildHoldings(investmentTx, []).realizedTrades;
+}
+
+// ─── PRICE FETCH — Google Finance scrape (works from any origin) ─────────────
+//
+// Strategy: Scrape Google Finance HTML page for the price.
+// Google Finance pages are publicly accessible and return structured HTML
+// with the price embedded. We use two CORS proxy services in a waterfall.
+//
+// Symbol mapping → Google Finance format:
+//   ITC          → NSE:ITC
+//   NSE:ITC      → NSE:ITC  (passthrough)
+//   MUTF_IN:xxx  → MUTF_IN:xxx (passthrough)
+//   ITC.NS       → NSE:ITC
+//
+// CORS proxy waterfall (tested to work from localhost AND production):
+//   1. allorigins.win  — most reliable, supports all origins
+//   2. corsproxy.io    — good fallback
+//   Timeout: 8s per proxy attempt
+//
+function toGoogleSymbol(raw) {
+  if (!raw) return null;
+  const s = raw.trim();
+  // Already Google format with colon
+  if (s.includes(":")) return s;
+  // Yahoo-style suffix
+  if (s.endsWith(".NS")) return "NSE:" + s.slice(0, -3);
+  if (s.endsWith(".BO")) return "BSE:" + s.slice(0, -3);
+  // Bare symbol — assume NSE
+  return "NSE:" + s;
+}
+
+function toYahooSymbol(raw) {
+  if (!raw) return null;
+  const s = raw.trim();
+  if (/\.[A-Z]{1,3}$/.test(s)) return s;
+  const colonIdx = s.indexOf(":");
+  if (colonIdx > 0) {
+    const exchange = s.slice(0, colonIdx).toUpperCase();
+    const ticker   = s.slice(colonIdx + 1);
+    if (exchange === "MUTF_IN") return ticker + ".BO";
+    if (exchange === "NSE")     return ticker + ".NS";
+    if (exchange === "BSE")     return ticker + ".BO";
+    return ticker + ".NS";
+  }
+  return s + ".NS";
+}
+
+// Parse price from Google Finance HTML
+function parseGoogleFinancePrice(html) {
+  if (!html) return null;
+  // Google Finance embeds price in multiple formats; try each
+  const patterns = [
+    // JSON-LD / data attribute: "price":"450.25"
+    /"price"\s*:\s*"?([\d,]+\.?\d*)"/,
+    // The main price display div uses data-last-price
+    /data-last-price="([\d.]+)"/,
+    // Structured data price pattern
+    /"regularMarketPrice"\s*:\s*([\d.]+)/,
+    // Price in the page title or meta
+    /content="[\w\s]+\s+([\d,]+\.?\d*)\s*(?:INR|₹)/,
+    // YFinance-style embedded JSON
+    /"currentPrice"\s*:\s*([\d.]+)/,
+  ];
+  for (const re of patterns) {
+    const m = html.match(re);
+    if (m) {
+      const val = parseFloat(m[1].replace(/,/g, ""));
+      if (val > 0) return val;
+    }
+  }
+  return null;
+}
+
+async function _fetchViaProxy(url) {
+  // Proxy 1: allorigins.win — wraps response in {contents:"..."}
+  const proxies = [
+    async (u) => {
+      const r = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(u)}`, {
+        signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
+      });
+      if (!r.ok) throw new Error("allorigins failed");
+      const j = await r.json();
+      return j.contents || "";
+    },
+    async (u) => {
+      const r = await fetch(`https://corsproxy.io/?${encodeURIComponent(u)}`, {
+        signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
+      });
+      if (!r.ok) throw new Error("corsproxy failed");
+      return await r.text();
+    },
+  ];
+  for (const proxy of proxies) {
+    try {
+      const text = await proxy(url);
+      if (text && text.length > 100) return text;
+    } catch {}
+  }
+  return null;
+}
+
+// Fetch price from Google Finance for one symbol
+async function _fetchGooglePrice(googleSym) {
+  const url = `https://www.google.com/finance/quote/${encodeURIComponent(googleSym)}`;
+  const html = await _fetchViaProxy(url);
+  if (!html) return null;
+  return parseGoogleFinancePrice(html);
+}
+
+// Fetch price from Yahoo Finance (more reliable numeric data)
+async function _fetchYahooPrice(yahooSym) {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=1d&range=1d`;
+  const raw = await _fetchViaProxy(url);
+  if (!raw) return null;
+  try {
+    const data = JSON.parse(raw);
+    const price = data?.chart?.result?.[0]?.meta?.regularMarketPrice;
+    return price && price > 0 ? parseFloat(price.toFixed(2)) : null;
+  } catch { return null; }
+}
+
+async function fetchLivePrice(symbol) {
+  if (!symbol) return null;
+  // Try Yahoo Finance first (clean JSON, easy to parse)
+  try {
+    const yahooSym = toYahooSymbol(symbol);
+    const yPrice = await _fetchYahooPrice(yahooSym);
+    if (yPrice && yPrice > 0) return yPrice;
+  } catch {}
+  // Fall back to Google Finance HTML scraping
+  try {
+    const gSym = toGoogleSymbol(symbol);
+    const gPrice = await _fetchGooglePrice(gSym);
+    if (gPrice && gPrice > 0) return gPrice;
+  } catch {}
+  return null;
+}
+
+// Fetch prices for multiple symbols sequentially
+async function fetchMultiplePrices(symbols) {
+  if (!symbols || symbols.length === 0) return {};
+  const result = {};
+  for (let i = 0; i < symbols.length; i++) {
+    try {
+      const price = await fetchLivePrice(symbols[i]);
+      if (price && price > 0) result[symbols[i]] = price;
+    } catch {}
+    if (i < symbols.length - 1) await new Promise(r => setTimeout(r, 400));
+  }
+  return result;
+}
+
+// ─── FD INTEREST CALCULATOR ──────────────────────────────────────────────────
+function calcFDReturns(fd) {
+  const principal = parseFloat(fd.amount)||0;
+  const rate      = parseFloat(fd.interestRate)||0;
+  const start     = new Date(fd.investedDate+"T00:00:00");
+  const end       = new Date(fd.maturityDate+"T00:00:00");
+  const years     = Math.max(0, (end - start) / (1000*60*60*24*365.25));
+  const interest  = principal * (rate/100) * years;
+  return { principal, interest: parseFloat(interest.toFixed(2)), maturityValue: parseFloat((principal+interest).toFixed(2)), years: parseFloat(years.toFixed(2)) };
+}
+
+// ─── BUILD TRADE BALANCE EFFECTS ──────────────────────────────────────────────
+// Derives tradeBalanceEffects from full investmentTx array.
+// Called when rebuilding from scratch (edit/delete trade).
+// BUY: sign = -1 (deduct from source)
+// SELL: sign = +1 (credit to source)
+function buildTradeBalanceEffects(investmentTx, fixedDeposits) {
+  const stockEffects = (investmentTx||[])
+    .filter(itx => itx.sourceAccountId && !itx.invType?.includes("fd"))
+    .map(itx => ({
+      id:        "eff_" + itx.id,
+      accountId: itx.sourceAccountId,
+      amount:    (parseFloat(itx.quantity)||0) * (parseFloat(itx.price)||0),
+      sign:      itx.type === "buy" ? -1 : 1,
+      tradeId:   itx.id,
+      date:      itx.date,
+    }));
+  // FD effects: each FD deducts from its source account
+  const fdEffects = (fixedDeposits||[])
+    .filter(fd => fd.sourceAccountId && parseFloat(fd.amount) > 0)
+    .map(fd => ({
+      id:        "fdeff_" + fd.id,
+      accountId: fd.sourceAccountId,
+      amount:    parseFloat(fd.amount),
+      sign:      -1,
+      tradeId:   fd.id,
+      date:      fd.investedDate || "",
+      isFD:      true,
+    }));
+  return [...stockEffects, ...fdEffects];
+}
+
 // ─── REDUCER ─────────────────────────────────────────────────────────────────
 function reducer(rawState, action) {
   const s = sanitize(rawState);
@@ -295,6 +685,8 @@ function reducer(rawState, action) {
     case "SET":         return sanitize(action.payload);
 
     // ── Transactions ─────────────────────────────────────────────────────────
+    // Transactions are INCOME or EXPENSE only (transfer preserved for UI compat).
+    // is_refund flag marks refund-type income transactions.
     case "ADD_TX":      return { ...s, transactions: [...s.transactions, action.payload] };
 
     case "EDIT_TX":     return { ...s, transactions: s.transactions.map(t =>
@@ -315,7 +707,7 @@ function reducer(rawState, action) {
           return {
             ...t,
             refundedAmount: next,
-            // Mark fully refunded if refunded >= original amount
+            is_refund: true,
             isRefunded: next >= (parseFloat(t.amount)||0),
           };
         }),
@@ -323,9 +715,9 @@ function reducer(rawState, action) {
     }
 
     // ── Accounts ─────────────────────────────────────────────────────────────
-    case "ADD_ACCOUNT":  return { ...s, accounts: [...s.accounts, action.payload] };
+    case "ADD_ACCOUNT":  return { ...s, accounts: [...s.accounts, sanitizeAccount(action.payload)] };
     case "EDIT_ACCOUNT": return { ...s, accounts: s.accounts.map(a =>
-                           a.id === action.payload.id ? action.payload : a) };
+                           a.id === action.payload.id ? sanitizeAccount(action.payload) : a) };
 
     // ── Account categories (fully CRUD) ──────────────────────────────────────
     case "ADD_ACC_CAT":  return { ...s, accountCategories: [...s.accountCategories, action.payload] };
@@ -347,29 +739,353 @@ function reducer(rawState, action) {
     // ── FX ───────────────────────────────────────────────────────────────────
     case "SET_FX":       return { ...s, fxRates: action.payload };
 
-    // ── Investments ───────────────────────────────────────────────────────────
-    case "ADD_INVESTMENT": {
-      const { newHolding, itx, txType, quantity, price, invType } = action.payload;
-      let holdings = [...s.holdings];
-      if (newHolding) {
-        holdings = [...holdings, newHolding];
-      } else {
-        holdings = holdings.map(h => {
-          if (h.id !== itx.holdingId) return h;
-          const cur = h.quantity || h.units || 0;
-          if (txType === "buy") {
-            const newQty = cur + quantity;
-            const newAvg = (cur*(h.avgPrice||h.nav||0) + quantity*price) / newQty;
-            return invType==="stock" ? {...h, quantity:newQty, avgPrice:newAvg} : {...h, units:newQty, nav:price};
-          } else {
-            return invType==="stock" ? {...h, quantity:Math.max(0,cur-quantity)} : {...h, units:Math.max(0,cur-quantity)};
-          }
-        });
-      }
+    // ── Accounts – hard delete (only if no transactions touch it) ─────────────
+    case "DELETE_ACCOUNT": return { ...s, accounts: s.accounts.filter(a => a.id !== action.payload) };
+
+    // ── Stocks Master Table ────────────────────────────────────────────────────
+    // ADD_STOCK: { id, symbol, name, type, exchange }
+    case "ADD_STOCK":    return { ...s, stocks: [...(s.stocks||[]), action.payload] };
+    case "EDIT_STOCK":   return { ...s, stocks: (s.stocks||[]).map(st => st.id===action.payload.id ? action.payload : st) };
+    case "DELETE_STOCK": return { ...s, stocks: (s.stocks||[]).filter(st => st.id !== action.payload) };
+    // RENAME_STOCK: rename symbol in stocks table + update all holdings + investmentTx
+    case "RENAME_STOCK": {
+      const { oldSymbol, newSymbol, newName } = action.payload;
       return {
         ...s,
-        holdings: holdings.filter(h => (h.quantity||0)>0 || (h.units||0)>0 || newHolding?.id===h.id),
-        investmentTx: [...s.investmentTx, itx],
+        stocks: (s.stocks||[]).map(st => st.symbol===oldSymbol ? {...st, symbol:newSymbol, name:newName||st.name} : st),
+        holdings: (s.holdings||[]).map(h => h.symbol===oldSymbol ? {...h, symbol:newSymbol, name:newName||h.name} : h),
+        investmentTx: (s.investmentTx||[]).map(t => t.symbol===oldSymbol ? {...t, symbol:newSymbol} : t),
+        marketPrices: (() => {
+          const mp = {...(s.marketPrices||{})};
+          if (mp[oldSymbol]) { mp[newSymbol]=mp[oldSymbol]; delete mp[oldSymbol]; }
+          return mp;
+        })(),
+      };
+    }
+
+    // ── Market Prices ──────────────────────────────────────────────────────────
+    // UPDATE_MARKET_PRICE: { symbol, current_price, last_updated }
+    // Stores fetched prices separately from trade prices.
+    case "UPDATE_MARKET_PRICE": {
+      const { symbol, current_price, last_updated } = action.payload;
+      return {
+        ...s,
+        marketPrices: {
+          ...s.marketPrices,
+          [symbol]: { current_price, last_updated: last_updated || new Date().toISOString() },
+        },
+      };
+    }
+
+    // ── Corporate Actions ──────────────────────────────────────────────────────
+    // ADD_CORPORATE_ACTION: { id, symbol, action_type, ratio, date, note }
+    // action_type: stock_split | bonus | reverse_split | dividend | stock_name_change
+    // This stores the action AND updates affected holdings.
+    case "ADD_CORPORATE_ACTION": {
+      const ca  = action.payload;
+      const newActions = [...s.corporateActions, ca];
+      let holdings = [...s.holdings];
+
+      if (ca.action_type === "stock_split" || ca.action_type === "bonus") {
+        // qty * ratio; avgPrice / ratio
+        holdings = holdings.map(h => {
+          if (h.symbol !== ca.symbol) return h;
+          const ratio = parseFloat(ca.ratio) || 1;
+          const newQty = (h.quantity || h.units || 0) * ratio;
+          const newAvg = (h.avgPrice || h.nav || 0) / ratio;
+          return { ...h, quantity: h.type !== "mf" ? newQty : 0,
+                         units: h.type === "mf" ? newQty : 0,
+                         avgPrice: newAvg, nav: newAvg };
+        });
+      } else if (ca.action_type === "reverse_split") {
+        // qty / ratio; avgPrice * ratio
+        holdings = holdings.map(h => {
+          if (h.symbol !== ca.symbol) return h;
+          const ratio = parseFloat(ca.ratio) || 1;
+          const newQty = (h.quantity || h.units || 0) / ratio;
+          const newAvg = (h.avgPrice || h.nav || 0) * ratio;
+          return { ...h, quantity: h.type !== "mf" ? newQty : 0,
+                         units: h.type === "mf" ? newQty : 0,
+                         avgPrice: newAvg, nav: newAvg };
+        });
+      } else if (ca.action_type === "stock_name_change") {
+        // Update symbol and name on holdings
+        const { new_symbol, new_name } = ca;
+        holdings = holdings.map(h => {
+          if (h.symbol !== ca.symbol) return h;
+          return { ...h, symbol: new_symbol || h.symbol, name: new_name || h.name };
+        });
+      }
+      // dividend: income only — create a transaction instead (handled in UI)
+      return { ...s, corporateActions: newActions, holdings };
+    }
+
+    // ── Delete Corporate Action (reverses holdings effect) ───────────────────
+    case "DELETE_CORPORATE_ACTION": {
+      const caId = action.payload;
+      const ca = (s.corporateActions||[]).find(c => c.id===caId);
+      if (!ca) return s;
+      const newActions = s.corporateActions.filter(c => c.id!==caId);
+      let holdings = [...s.holdings];
+
+      if (ca.action_type === "stock_split" || ca.action_type === "bonus") {
+        const ratio = parseFloat(ca.ratio)||1;
+        holdings = holdings.map(h => {
+          if (h.symbol !== ca.symbol) return h;
+          const newQty = (h.quantity||h.units||0) / ratio;
+          const newAvg = (h.avgPrice||h.nav||0) * ratio;
+          return { ...h, quantity: h.type!=="mf"?newQty:0, units: h.type==="mf"?newQty:0, avgPrice:newAvg, nav:newAvg };
+        });
+      } else if (ca.action_type === "reverse_split") {
+        const ratio = parseFloat(ca.ratio)||1;
+        holdings = holdings.map(h => {
+          if (h.symbol !== ca.symbol) return h;
+          const newQty = (h.quantity||h.units||0) * ratio;
+          const newAvg = (h.avgPrice||h.nav||0) / ratio;
+          return { ...h, quantity: h.type!=="mf"?newQty:0, units: h.type==="mf"?newQty:0, avgPrice:newAvg, nav:newAvg };
+        });
+      } else if (ca.action_type === "stock_name_change") {
+        // Reverse: rename back to old symbol
+        holdings = holdings.map(h => {
+          if (h.symbol !== ca.new_symbol) return h;
+          return { ...h, symbol: ca.symbol, name: ca.old_name||ca.symbol };
+        });
+      } else if (ca.action_type === "merger") {
+        // Reverse merger: remove the merged-into stock holdings (simplistic)
+        holdings = holdings.filter(h => h.symbol !== (ca.to_symbol||ca.symbol));
+      } else if (ca.action_type === "demerger") {
+        // Reverse demerger: remove the newly created split stocks
+        const newSymbols = (ca.result_symbols||[]).filter(sym => sym !== ca.symbol);
+        holdings = holdings.filter(h => !newSymbols.includes(h.symbol));
+      }
+      return { ...s, corporateActions: newActions, holdings };
+    }
+
+    // ── Bulk Delete Holdings ──────────────────────────────────────────────────
+    case "BULK_DELETE_HOLDINGS": {
+      const symbols = action.payload;
+      const newTxs     = s.investmentTx.filter(t => !symbols.includes(t.symbol));
+      const newActions = s.corporateActions.filter(ca => !symbols.includes(ca.symbol));
+      const { holdings: newHoldings } = rebuildHoldings(newTxs, s.holdings);
+      const newEffects = buildTradeBalanceEffects(newTxs, s.fixedDeposits);
+      return { ...s, holdings: newHoldings, investmentTx: newTxs, corporateActions: newActions, tradeBalanceEffects: newEffects };
+    }
+
+    // ── Investments (full FIFO-aware) ─────────────────────────────────────────
+    // ADD_INVESTMENT: { newHolding, itx }
+    // BUY:  deducts trade value from sourceAccountId via tradeBalanceEffect
+    // SELL: credits trade value to sourceAccountId via tradeBalanceEffect
+    // Holdings are updated incrementally here (not rebuilt from scratch).
+    case "ADD_INVESTMENT": {
+      const { newHolding, itx } = action.payload;
+      const tradeAmt = (parseFloat(itx.quantity)||0) * (parseFloat(itx.price)||0);
+
+      // Trade balance effect: BUY deducts from source, SELL credits source
+      const tradeEffects = [...s.tradeBalanceEffects];
+      if (itx.sourceAccountId && tradeAmt > 0) {
+        tradeEffects.push({
+          id:        uid(),
+          accountId: itx.sourceAccountId,
+          amount:    tradeAmt,
+          sign:      itx.type === "buy" ? -1 : 1,  // buy deducts, sell credits
+          tradeId:   itx.id,
+          date:      itx.date,
+        });
+      }
+
+      // Incremental holdings update (FIFO for sells)
+      let holdings = [...s.holdings];
+      const existingIdx = holdings.findIndex(h =>
+        h.id === (newHolding?.id || itx.holdingId) ||
+        (h.symbol === itx.symbol && h.accountId === itx.accountId)
+      );
+
+      if (itx.type === "buy") {
+        if (existingIdx >= 0) {
+          // Update existing holding incrementally
+          const h = holdings[existingIdx];
+          const newQty = (h.quantity || h.units || 0) + (parseFloat(itx.quantity)||0);
+          const newInvested = (h.investedAmount || 0) + tradeAmt;
+          const newAvg = newQty > 0 ? newInvested / newQty : 0;
+          const newLots = [...(h.lots||[]), { qty: parseFloat(itx.quantity)||0, price: parseFloat(itx.price)||0, date: itx.date, txId: itx.id }];
+          holdings[existingIdx] = {
+            ...h,
+            lots: newLots,
+            quantity: h.type !== "mf" ? newQty : 0,
+            units:    h.type === "mf" ? newQty : 0,
+            avgPrice: newAvg, nav: h.type === "mf" ? newAvg : h.nav,
+            investedAmount: newInvested,
+          };
+        } else if (newHolding) {
+          // Brand new holding
+          const qty = parseFloat(itx.quantity)||0;
+          holdings.push({
+            ...newHolding,
+            lots: [{ qty, price: parseFloat(itx.price)||0, date: itx.date, txId: itx.id }],
+            quantity: newHolding.type !== "mf" ? qty : 0,
+            units:    newHolding.type === "mf" ? qty : 0,
+            avgPrice: parseFloat(itx.price)||0,
+            investedAmount: tradeAmt,
+          });
+        }
+      } else if (itx.type === "sell" && existingIdx >= 0) {
+        // FIFO sell on existing holding
+        const h = holdings[existingIdx];
+        let lots = [...(h.lots||[])].sort((a,b) => new Date(a.date) - new Date(b.date));
+        let remaining = parseFloat(itx.quantity)||0;
+        let investedReduction = 0;
+        for (let i = 0; i < lots.length && remaining > 0; i++) {
+          if (lots[i].qty <= remaining) {
+            investedReduction += lots[i].qty * lots[i].price;
+            remaining -= lots[i].qty;
+            lots[i] = { ...lots[i], qty: 0 };
+          } else {
+            investedReduction += remaining * lots[i].price;
+            lots[i] = { ...lots[i], qty: lots[i].qty - remaining };
+            remaining = 0;
+          }
+        }
+        lots = lots.filter(l => l.qty > 0);
+        const newQty = lots.reduce((s,l) => s + l.qty, 0);
+        const newInvested = Math.max(0, (h.investedAmount||0) - investedReduction);
+        const newAvg = newQty > 0 ? newInvested / newQty : 0;
+        if (newQty <= 0) {
+          holdings.splice(existingIdx, 1); // fully sold out
+        } else {
+          holdings[existingIdx] = {
+            ...h, lots,
+            quantity: h.type !== "mf" ? newQty : 0,
+            units:    h.type === "mf" ? newQty : 0,
+            avgPrice: newAvg, nav: h.type === "mf" ? newAvg : h.nav,
+            investedAmount: newInvested,
+          };
+        }
+      }
+
+      return {
+        ...s,
+        holdings,
+        investmentTx:        [...s.investmentTx, itx],
+        tradeBalanceEffects: tradeEffects,
+      };
+    }
+
+    case "EDIT_INVESTMENT_TX": {
+      if (!action.payload?.id) return s;
+      const newTxs = s.investmentTx.map(t => t.id===action.payload.id ? action.payload : t);
+      const { holdings: rebuilt } = rebuildHoldings(newTxs, s.holdings);
+      const stockEffects = buildTradeBalanceEffects(newTxs, []);
+      const fdEffects = s.tradeBalanceEffects.filter(e => e.isFD);
+      return { ...s, investmentTx: newTxs, holdings: rebuilt, tradeBalanceEffects: [...stockEffects, ...fdEffects] };
+    }
+
+    case "DELETE_INVESTMENT_TX": {
+      const tid = action.payload;
+      if (!tid) return s;
+      const newTxs = s.investmentTx.filter(t => t.id !== tid);
+      if (newTxs.length === s.investmentTx.length) return s;
+      const { holdings: rebuilt } = rebuildHoldings(newTxs, s.holdings);
+      const stockEffects = buildTradeBalanceEffects(newTxs, []);
+      const fdEffects = s.tradeBalanceEffects.filter(e => e.isFD);
+      return { ...s, investmentTx: newTxs, holdings: rebuilt, tradeBalanceEffects: [...stockEffects, ...fdEffects] };
+    }
+
+    // Bulk delete multiple trades at once (Trade History multi-select)
+    case "BULK_DELETE_INVESTMENT_TXS": {
+      const ids = new Set(action.payload || []);
+      if (ids.size === 0) return s;
+      const newTxs = s.investmentTx.filter(t => !ids.has(t.id));
+      if (newTxs.length === s.investmentTx.length) return s;
+      const { holdings: rebuilt } = rebuildHoldings(newTxs, s.holdings);
+      const stockEffects = buildTradeBalanceEffects(newTxs, []);
+      const fdEffects = s.tradeBalanceEffects.filter(e => e.isFD);
+      return { ...s, investmentTx: newTxs, holdings: rebuilt, tradeBalanceEffects: [...stockEffects, ...fdEffects] };
+    }
+
+    // ── Fixed Deposits ────────────────────────────────────────────────────────
+    case "ADD_FD": {
+      const fd = action.payload;
+      // Sync: deduct principal from source account via tradeBalanceEffect
+      const fdEffects = [...s.tradeBalanceEffects];
+      if (fd.sourceAccountId && parseFloat(fd.amount) > 0) {
+        fdEffects.push({
+          id: "fdeff_" + fd.id,
+          accountId: fd.sourceAccountId,
+          amount: parseFloat(fd.amount),
+          sign: -1, // deduct from source
+          tradeId: fd.id,
+          date: fd.investedDate || new Date().toISOString().slice(0,10),
+          isFD: true,
+        });
+      }
+      return { ...s, fixedDeposits: [...(s.fixedDeposits||[]), fd], tradeBalanceEffects: fdEffects };
+    }
+    case "EDIT_FD": {
+      const updated = action.payload;
+      const old = (s.fixedDeposits||[]).find(f => f.id === updated.id);
+      // Rebuild FD effects: remove old, add new
+      let effs = s.tradeBalanceEffects.filter(e => e.tradeId !== updated.id);
+      if (updated.sourceAccountId && parseFloat(updated.amount) > 0) {
+        effs.push({
+          id: "fdeff_" + updated.id,
+          accountId: updated.sourceAccountId,
+          amount: parseFloat(updated.amount),
+          sign: -1,
+          tradeId: updated.id,
+          date: updated.investedDate || new Date().toISOString().slice(0,10),
+          isFD: true,
+        });
+      }
+      return { ...s, fixedDeposits: (s.fixedDeposits||[]).map(f => f.id===updated.id ? updated : f), tradeBalanceEffects: effs };
+    }
+    case "DELETE_FD": {
+      const fdId = action.payload;
+      // Remove tradeBalanceEffect for this FD
+      const effs = s.tradeBalanceEffects.filter(e => e.tradeId !== fdId);
+      return { ...s, fixedDeposits: (s.fixedDeposits||[]).filter(f => f.id !== fdId), tradeBalanceEffects: effs };
+    }
+    // CLOSE_FD: credit principal + interest to selected account
+    case "CLOSE_FD": {
+      const { fdId, incomeAccId, interestAmt, closeDate } = action.payload;
+      const fd = (s.fixedDeposits||[]).find(f => f.id === fdId);
+      if (!fd) return s;
+
+      const targetAccId = incomeAccId || fd.sourceAccountId;
+      const principal   = parseFloat(fd.amount) || 0;
+      const interest    = parseFloat(interestAmt) || 0;
+      const totalCredit = principal + interest;
+
+      // Remove the original deduction effect, replace with full maturity credit
+      let effs = s.tradeBalanceEffects.filter(e => e.tradeId !== fdId);
+      if (targetAccId && totalCredit > 0) {
+        effs.push({
+          id:        "fdclose_" + fdId,
+          accountId: targetAccId,
+          amount:    totalCredit,           // principal + interest
+          sign:      +1,                    // credit to account
+          tradeId:   fdId + "_close",
+          date:      closeDate,
+          isFD:      true,
+        });
+      }
+
+      // Also record interest as income transaction for bookkeeping
+      const incTx = interest > 0 ? {
+        id:         uid(),
+        type:       "income",
+        amount:     interest,
+        accountId:  targetAccId,
+        categoryId: "ic_int",
+        date:       closeDate,
+        note:       `FD interest: ${fd.name || "Fixed Deposit"}`,
+        currency:   fd.currency || "INR",
+      } : null;
+
+      return {
+        ...s,
+        fixedDeposits:      (s.fixedDeposits||[]).filter(f => f.id !== fdId),
+        tradeBalanceEffects: effs,
+        transactions:        incTx ? [...s.transactions, incTx] : s.transactions,
       };
     }
 
@@ -421,6 +1137,9 @@ function ToastContainer({ toasts }) {
         @keyframes toastIn {
           from { opacity:0; transform:translateY(-8px) scale(0.97); }
           to   { opacity:1; transform:translateY(0) scale(1); }
+        }
+        @keyframes spin {
+          to { transform: rotate(360deg); }
         }
       `}</style>
     </div>
@@ -847,95 +1566,13 @@ function AccountModal({ state, onClose, onSave, editAcc }) {
   );
 }
 
-// ─── ACCOUNT TYPE MODAL (CRUD) ────────────────────────────────────────────────
-// Replaces old AccCatModal. Full create/edit/delete for account types.
-// isCreditCardType flag enables CC billing logic for accounts of that type.
+// ─── ACCOUNT TYPE MODAL ───────────────────────────────────────────────────────
+// Thin wrapper around AccTypeInlineManager that displays it in a Modal.
+// AccTypeInlineManager is the canonical implementation; this avoids duplication.
 function AccTypeModal({ state, dispatch, onClose }) {
-  const cats     = state?.accountCategories || DEFAULT.accountCategories;
-  const accounts = state?.accounts || [];
-  const icons    = ["🏷️","🏦","💵","💳","📱","📈","📊","💰","🏧","🪙","🏠","🚗","✈️","🎮","📚","🔐","🏛️","💸","🏢","🛡️"];
-  const colors   = ["#3B82F6","#10B981","#EF4444","#F59E0B","#8B5CF6","#06B6D4","#EC4899","#6B7280","#0EA5E9","#84CC16"];
-
-  // null = list view, "new" = add form, object = edit form
-  const [editing, setEditing] = useState(null);
-  const [name,    setName]    = useState("");
-  const [icon,    setIcon]    = useState("🏷️");
-  const [color,   setColor]   = useState(colors[0]);
-  const [isCCType,setIsCCType]= useState(false);
-
-  function startNew()  { setEditing("new"); setName(""); setIcon("🏷️"); setColor(colors[0]); setIsCCType(false); }
-  function startEdit(c){ setEditing(c); setName(c.name); setIcon(c.icon); setColor(c.color||colors[0]); setIsCCType(!!c.isCreditCardType); }
-  function cancel()    { setEditing(null); }
-
-  function save() {
-    if (!name.trim()) return;
-    if (editing === "new") {
-      dispatch({ type:"ADD_ACC_CAT", payload:{ id:uid(), name:name.trim(), icon, color, isCreditCardType:isCCType } });
-      toast("Account type added");
-    } else {
-      dispatch({ type:"EDIT_ACC_CAT", payload:{ ...editing, name:name.trim(), icon, color, isCreditCardType:isCCType } });
-      toast("Account type updated");
-    }
-    setEditing(null);
-  }
-
-  function del(cat) {
-    const inUse = accounts.some(a => a.categoryId === cat.id);
-    if (inUse) { toast(`"${cat.name}" is used by ${accounts.filter(a=>a.categoryId===cat.id).length} account(s) — reassign or delete them first`, "error"); return; }
-    dispatch({ type:"DEL_ACC_CAT", payload: cat.id });
-    toast("Account type deleted");
-  }
-
-  if (editing !== null) {
-    return (
-      <Modal title={editing==="new" ? "New Account Type" : "Edit Account Type"} onClose={cancel}>
-        <Inp label="Type Name" value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. Bank, Loan, Crypto, PPF…" />
-        <Field label="Icon">
-          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-            {icons.map(ic=><button key={ic} onClick={()=>setIcon(ic)} style={{width:40,height:40,borderRadius:10,border:`2px solid ${icon===ic?"#6366F1":"#E2E8F0"}`,background:icon===ic?"#EEF2FF":"#F8FAFC",fontSize:20,cursor:"pointer"}}>{ic}</button>)}
-          </div>
-        </Field>
-        <Field label="Color">
-          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-            {colors.map(c=><button key={c} onClick={()=>setColor(c)} style={{width:32,height:32,borderRadius:"50%",background:c,border:color===c?"3px solid #0F172A":"2px solid transparent",cursor:"pointer"}} />)}
-          </div>
-        </Field>
-        <Toggle
-          label="Is this a Credit Card type?"
-          checked={isCCType} onChange={setIsCCType}
-          note="Enables CC billing cycles and cashback for accounts of this type"
-        />
-        <BtnRow>
-          <Btn variant="ghost" onClick={cancel}>Back</Btn>
-          <Btn onClick={save}>{editing==="new"?"Add Type":"Save Changes"}</Btn>
-        </BtnRow>
-      </Modal>
-    );
-  }
-
   return (
     <Modal title="Account Types" onClose={onClose}>
-      <Btn onClick={startNew} style={{width:"100%",marginBottom:16}}>+ New Account Type</Btn>
-      {cats.length===0 && (
-        <div style={{textAlign:"center",padding:24,color:"#94A3B8",fontSize:14}}>No account types yet.</div>
-      )}
-      {cats.map(cat => {
-        const count = accounts.filter(a => a.categoryId === cat.id).length;
-        return (
-          <div key={cat.id} style={{display:"flex",alignItems:"center",gap:10,padding:"12px 0",borderBottom:"1px solid #F1F5F9"}}>
-            <div style={{width:36,height:36,borderRadius:10,background:cat.color+"22",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>{cat.icon}</div>
-            <div style={{flex:1,minWidth:0}}>
-              <div style={{fontWeight:600,fontSize:14,display:"flex",alignItems:"center",gap:6}}>
-                {cat.name}
-                {cat.isCreditCardType&&<span style={{fontSize:10,background:"#FEF2F2",color:"#EF4444",padding:"1px 6px",borderRadius:10,fontWeight:700}}>CC</span>}
-              </div>
-              <div style={{fontSize:11,color:"#94A3B8"}}>{count} account{count!==1?"s":""}</div>
-            </div>
-            <button onClick={()=>startEdit(cat)} style={{fontSize:12,padding:"5px 10px",borderRadius:8,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>✏️</button>
-            <button onClick={()=>del(cat)}        style={{fontSize:12,padding:"5px 10px",borderRadius:8,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>🗑️</button>
-          </div>
-        );
-      })}
+      <AccTypeInlineManager state={state} dispatch={dispatch} />
       <div style={{marginTop:12}}>
         <Btn variant="ghost" onClick={onClose} style={{width:"100%"}}>Close</Btn>
       </div>
@@ -1324,90 +1961,6 @@ function TxModalWithDispatch({ state, onClose, onSave, editTx, dispatch }) {
   );
 }
 
-// ─── INVESTMENT MODAL ─────────────────────────────────────────────────────────
-function InvestModal({ state, onClose, onSave }) {
-  const accounts = (state?.accounts||[]).filter(a=>!a.disabled);
-  const [txType,setTxType] = useState("buy");
-  const [invType,setInvType] = useState("stock");
-  const [symbol,setSymbol]  = useState("");
-  const [name,setName]      = useState("");
-  const [qty,setQty]        = useState("");
-  const [price,setPrice]    = useState("");
-  const [cur,setCur]        = useState("INR");
-  const [date,setDate]      = useState(new Date().toISOString().split("T")[0]);
-  const [accId,setAccId]    = useState(accounts[0]?.id||"");
-  const [brok,setBrok]      = useState("0");
-  const [note,setNote]      = useState("");
-
-  const existing = (state?.holdings||[]).find(h=>h.symbol===symbol.toUpperCase()&&h.type===invType&&h.accountId===accId);
-  const total    = (parseFloat(qty)||0)*(parseFloat(price)||0);
-  const curObj   = CURRENCIES.find(c=>c.code===cur)||CURRENCIES[0];
-
-  function save() {
-    if (!symbol||!qty||!price) { toast("Fill in symbol, quantity and price","error"); return; }
-    const q=parseFloat(qty),p=parseFloat(price),b=parseFloat(brok)||0;
-    let holdingId, newHolding=null;
-    if (existing) { holdingId=existing.id; }
-    else if (txType==="buy") {
-      holdingId=uid();
-      newHolding={id:holdingId,type:invType,symbol:symbol.toUpperCase(),name:name||symbol.toUpperCase(),currency:cur,
-        quantity:invType==="stock"?q:0, units:invType==="mf"?q:0,
-        avgPrice:invType==="stock"?p:0, nav:invType==="mf"?p:0, accountId:accId};
-    }
-    const itx={id:uid(),holdingId,type:txType,quantity:q,price:p,currency:cur,date,accountId:accId,brokerage:b,note};
-    onSave({newHolding,itx,txType,symbol:symbol.toUpperCase(),quantity:q,price:p,currency:cur,accountId:accId,invType});
-    toast(`${txType==="buy"?"Buy":"Sell"} order recorded`);
-    onClose();
-  }
-
-  return (
-    <Modal title="Investment Transaction" onClose={onClose}>
-      <div style={{display:"flex",gap:8,marginBottom:16}}>
-        {["buy","sell"].map(t=>(
-          <button key={t} onClick={()=>setTxType(t)}
-            style={{flex:1,padding:"10px",borderRadius:10,border:`2px solid ${txType===t?(t==="buy"?"#10B981":"#EF4444"):"#E2E8F0"}`,background:txType===t?(t==="buy"?"#F0FDF4":"#FEF2F2"):"#fff",color:txType===t?(t==="buy"?"#10B981":"#EF4444"):"#64748B",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"inherit"}}>
-            {t==="buy"?"📥 Buy":"📤 Sell"}
-          </button>
-        ))}
-      </div>
-      <div style={{display:"flex",gap:8,marginBottom:16}}>
-        {[["stock","📊 Stock"],["mf","📈 Mutual Fund"]].map(([v,l])=>(
-          <button key={v} onClick={()=>setInvType(v)}
-            style={{flex:1,padding:"8px",borderRadius:10,border:`2px solid ${invType===v?"#6366F1":"#E2E8F0"}`,background:invType===v?"#EEF2FF":"#fff",color:invType===v?"#6366F1":"#64748B",fontWeight:600,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>{l}</button>
-        ))}
-      </div>
-      <Sel label="Account" value={accId} onChange={e=>setAccId(e.target.value)}>
-        {accounts.map(a=><option key={a.id} value={a.id}>{a.icon} {a.name}</option>)}
-      </Sel>
-      <Sel label="Currency" value={cur} onChange={e=>setCur(e.target.value)}>
-        {CURRENCIES.map(c=><option key={c.code} value={c.code}>{c.symbol} {c.code} — {c.name}</option>)}
-      </Sel>
-      <Inp label={invType==="stock"?"Symbol (e.g. AAPL, RELIANCE)":"Fund Code / Name"}
-           value={symbol} onChange={e=>setSymbol(e.target.value.toUpperCase())} placeholder={invType==="stock"?"AAPL, TCS…":"MIRAE_ELSS…"} />
-      <Inp label="Full Name (optional)" value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. Apple Inc." />
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-        <Inp label={invType==="stock"?"Shares":"Units"} type="number" inputMode="decimal" value={qty} onChange={e=>setQty(e.target.value)} />
-        <Inp label={`Price (${cur})`} type="number" inputMode="decimal" value={price} onChange={e=>setPrice(e.target.value)} />
-      </div>
-      {total>0&&(
-        <div style={{background:"#F0FDF4",border:"1.5px solid #A7F3D0",borderRadius:10,padding:12,marginBottom:16,fontSize:14,color:"#065F46"}}>
-          Total: <strong>{curObj.symbol}{fmtNum(total)}</strong>
-          {cur!=="INR"&&state?.fxRates?.[cur]?` ≈ ${fmtINR(total*state.fxRates[cur])}`:""}
-        </div>
-      )}
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-        <Inp label={`Brokerage (${cur})`} type="number" inputMode="decimal" value={brok} onChange={e=>setBrok(e.target.value)} />
-        <Inp label="Date" type="date" value={date} onChange={e=>setDate(e.target.value)} />
-      </div>
-      <Inp label="Note" value={note} onChange={e=>setNote(e.target.value)} placeholder="Optional…" />
-      <BtnRow>
-        <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-        <Btn variant={txType==="buy"?"success":"danger"} onClick={save}>{txType==="buy"?"Buy":"Sell"}</Btn>
-      </BtnRow>
-    </Modal>
-  );
-}
-
 // ─── TRANSACTION ROW ──────────────────────────────────────────────────────────
 function TxRow({ tx, state, onDelete, onEdit }) {
   const [open,setOpen] = useState(false);
@@ -1491,116 +2044,214 @@ function TxRow({ tx, state, onDelete, onEdit }) {
   );
 }
 
-// ─── ACCOUNT CARD ─────────────────────────────────────────────────────────────
-function AccountCard({ acc, transactions, accounts, fxRates, onEdit, onToggle, onCCSettings }) {
+// ─── ACCOUNT CARD (compact — actions moved to category header edit mode) ──────
+function AccountCard({ acc, transactions, accounts, fxRates, tradeBalanceEffects, editMode=false, onEdit, onToggle, onCCSettings, onDelete }) {
   const isCreditCard = !!acc.isCreditCard;
   const cur          = acc.currency||"INR";
-  const isDisabled   = !!acc.disabled;
+  const isDisabled   = acc.is_active === false || !!acc.disabled;
 
-  let displayBal, subLabel, canDisable;
-
+  let displayBal, subLabel;
   if (isCreditCard && acc.billDay) {
-    // Show outstanding + payable separately
     const { outstanding, payable } = calcCCBalance(acc, transactions);
-    displayBal = outstanding + payable;  // total owed
-    subLabel   = `Outstanding: ${fmtCur(outstanding,cur)}  |  Payable: ${fmtCur(payable,cur)}`;
-    canDisable = displayBal < 0.005;
+    // CC: show only Outstanding Balance + Due Amount
+    displayBal = outstanding + payable;
+    subLabel   = null; // handled inline below
+    return (
+      <Card style={{padding:"10px 12px",borderLeft:`4px solid ${isDisabled?"#CBD5E1":"#EF4444"}`,opacity:isDisabled?0.65:1}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+          <span style={{fontSize:16,flexShrink:0}}>{acc.icon}</span>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontWeight:700,fontSize:13,color:isDisabled?"#94A3B8":"#0F172A",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{acc.name}</div>
+            <div style={{fontSize:9,color:"#EF4444",fontWeight:700}}>CREDIT CARD</div>
+          </div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginTop:4}}>
+          <div style={{background:"#FEF2F2",borderRadius:7,padding:"5px 8px"}}>
+            <div style={{fontSize:9,color:"#94A3B8",marginBottom:1}}>Outstanding</div>
+            <div style={{fontWeight:800,fontSize:13,color:"#EF4444"}}>{fmtCur(outstanding,cur)}</div>
+          </div>
+          <div style={{background:"#FFF7ED",borderRadius:7,padding:"5px 8px"}}>
+            <div style={{fontSize:9,color:"#94A3B8",marginBottom:1}}>Due</div>
+            <div style={{fontWeight:800,fontSize:13,color:"#D97706"}}>{fmtCur(payable,cur)}</div>
+          </div>
+        </div>
+        {editMode&&(
+          <div style={{display:"flex",gap:5,flexWrap:"wrap",marginTop:8}}>
+            <button onClick={()=>onEdit(acc)} style={{fontSize:11,padding:"3px 8px",borderRadius:7,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>✏️ Edit</button>
+            {onCCSettings&&<button onClick={()=>onCCSettings(acc)} style={{fontSize:11,padding:"3px 8px",borderRadius:7,border:"1.5px solid #C7D2FE",background:"#EEF2FF",color:"#6366F1",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>⚙️ CC</button>}
+            {isDisabled
+              ? <button onClick={()=>onToggle(acc,false)} style={{fontSize:11,padding:"3px 8px",borderRadius:7,border:"1.5px solid #A7F3D0",background:"#F0FDF4",color:"#065F46",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>✅ Enable</button>
+              : <button onClick={()=>onToggle(acc,true)} style={{fontSize:11,padding:"3px 8px",borderRadius:7,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>🚫 Disable</button>}
+            {onDelete&&<button onClick={()=>onDelete(acc)} style={{fontSize:11,padding:"3px 8px",borderRadius:7,border:"1.5px solid #FECACA",background:"#FFF1F2",color:"#BE123C",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>🗑️</button>}
+          </div>
+        )}
+      </Card>
+    );
   } else {
-    displayBal = calcBalance(acc.id, transactions, accounts);
+    displayBal = calcBalance(acc.id, transactions, accounts, tradeBalanceEffects||[]);
     subLabel   = null;
-    canDisable = Math.abs(displayBal) < 0.005;
   }
 
   const inrEquiv = cur!=="INR" ? toINR(displayBal,cur,fxRates) : null;
+  const balColor = isDisabled?"#94A3B8":displayBal>=0?"#0F172A":"#EF4444";
 
   return (
-    <Card style={{padding:20,borderLeft:`4px solid ${isDisabled?"#CBD5E1":acc.color}`,opacity:isDisabled?0.65:1}}>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}}>
-        <div style={{display:"flex",alignItems:"center",gap:8}}>
-          <span style={{fontSize:26}}>{acc.icon}</span>
-          {isDisabled&&<span style={{fontSize:10,background:"#F1F5F9",color:"#94A3B8",padding:"2px 7px",borderRadius:10,fontWeight:700}}>DISABLED</span>}
-          {isCreditCard&&<span style={{fontSize:10,background:"#FEF2F2",color:"#EF4444",padding:"2px 7px",borderRadius:10,fontWeight:700}}>CC</span>}
+    <Card style={{padding:"10px 12px",borderLeft:`4px solid ${isDisabled?"#CBD5E1":acc.color||"#6B7280"}`,opacity:isDisabled?0.65:1}}>
+      <div style={{display:"flex",alignItems:"center",gap:6}}>
+        <span style={{fontSize:16,flexShrink:0}}>{acc.icon}</span>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{fontWeight:700,fontSize:13,color:isDisabled?"#94A3B8":"#0F172A",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{acc.name}</div>
+          <div style={{display:"flex",gap:4,flexWrap:"wrap",marginTop:1}}>
+            {isDisabled&&<span style={{fontSize:9,background:"#F1F5F9",color:"#94A3B8",padding:"1px 5px",borderRadius:8,fontWeight:700}}>OFF</span>}
+            <span style={{fontSize:9,background:"#F1F5F9",color:"#64748B",padding:"1px 5px",borderRadius:8,fontWeight:600}}>{cur}</span>
+          </div>
         </div>
-        <div style={{display:"flex",gap:6,alignItems:"center"}}>
-          {acc.includeInNetWorth&&<span style={{fontSize:10,background:"#F0FDF4",color:"#10B981",padding:"2px 7px",borderRadius:10,fontWeight:700}}>NW</span>}
-          <span style={{fontSize:10,background:"#F1F5F9",color:"#64748B",padding:"2px 8px",borderRadius:10,fontWeight:600,textTransform:"uppercase"}}>{cur}</span>
+        <div style={{textAlign:"right",flexShrink:0}}>
+          <div style={{fontSize:14,fontWeight:800,color:balColor}}>{fmtCur(Math.abs(displayBal),cur)}</div>
+          {inrEquiv!==null&&<div style={{fontSize:10,color:"#94A3B8"}}>≈{fmtINR(Math.abs(inrEquiv))}</div>}
         </div>
       </div>
-      <div style={{fontWeight:700,fontSize:15,color:isDisabled?"#94A3B8":"#0F172A",marginBottom:4}}>{acc.name}</div>
-      <div style={{fontSize:24,fontWeight:800,color:isDisabled?"#94A3B8":isCreditCard?"#EF4444":displayBal>=0?"#0F172A":"#EF4444"}}>
-        {isCreditCard?"−":""}{fmtCur(Math.abs(displayBal),cur)}
-      </div>
-      {inrEquiv!==null&&<div style={{fontSize:12,color:"#94A3B8",marginTop:3}}>≈ {fmtINR(Math.abs(inrEquiv))}</div>}
-      {subLabel&&<div style={{fontSize:11,color:"#94A3B8",marginTop:4,lineHeight:1.6}}>{subLabel}</div>}
-      {(parseFloat(acc.openingBalance)||0)!==0&&(
-        <div style={{fontSize:11,color:"#94A3B8",marginTop:3}}>Opening: {fmtCur(acc.openingBalance,cur)}</div>
+      {editMode&&(
+        <div style={{display:"flex",gap:5,flexWrap:"wrap",marginTop:8}}>
+          <button onClick={()=>onEdit(acc)} style={{fontSize:11,padding:"3px 8px",borderRadius:7,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>✏️ Edit</button>
+          {isDisabled
+            ? <button onClick={()=>onToggle(acc,false)} style={{fontSize:11,padding:"3px 8px",borderRadius:7,border:"1.5px solid #A7F3D0",background:"#F0FDF4",color:"#065F46",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>✅ Enable</button>
+            : <button onClick={()=>onToggle(acc,true)} style={{fontSize:11,padding:"3px 8px",borderRadius:7,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>🚫 Disable</button>}
+          {onDelete&&<button onClick={()=>onDelete(acc)} style={{fontSize:11,padding:"3px 8px",borderRadius:7,border:"1.5px solid #FECACA",background:"#FFF1F2",color:"#BE123C",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>🗑️</button>}
+        </div>
       )}
-      <div style={{display:"flex",gap:6,marginTop:14,flexWrap:"wrap"}}>
-        <button onClick={()=>onEdit(acc)}
-          style={{fontSize:12,padding:"5px 12px",borderRadius:8,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
-          ✏️ Edit
-        </button>
-        {isCreditCard&&onCCSettings&&(
-          <button onClick={()=>onCCSettings(acc)}
-            style={{fontSize:12,padding:"5px 12px",borderRadius:8,border:"1.5px solid #C7D2FE",background:"#EEF2FF",color:"#6366F1",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
-            ⚙️ CC Settings
-          </button>
-        )}
-        {isDisabled?(
-          <button onClick={()=>onToggle(acc,false)}
-            style={{fontSize:12,padding:"5px 12px",borderRadius:8,border:"1.5px solid #A7F3D0",background:"#F0FDF4",color:"#065F46",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
-            ✅ Enable
-          </button>
-        ):(
-          <button onClick={()=>canDisable&&onToggle(acc,true)}
-            title={canDisable?"Disable account":`Balance must be 0 to disable`}
-            style={{fontSize:12,padding:"5px 12px",borderRadius:8,border:`1.5px solid ${canDisable?"#FECACA":"#E2E8F0"}`,background:canDisable?"#FEF2F2":"#F8FAFC",color:canDisable?"#EF4444":"#CBD5E1",cursor:canDisable?"pointer":"not-allowed",fontFamily:"inherit",fontWeight:600}}>
-            🚫 Disable
-          </button>
-        )}
-      </div>
     </Card>
+  );
+}
+
+
+
+// ─── NET WORTH BREAKDOWN MODAL ────────────────────────────────────────────────
+function NetWorthBreakdownModal({ state, onClose }) {
+  const accounts            = state?.accounts            ||[];
+  const transactions        = state?.transactions        ||[];
+  const holdings            = state?.holdings            ||[];
+  const fxRates             = state?.fxRates             ||DEFAULT.fxRates;
+  const fixedDeposits       = state?.fixedDeposits       ||[];
+  const marketPrices        = state?.marketPrices        ||{};
+  const tradeBalanceEffects = state?.tradeBalanceEffects ||[];
+  const accountCategories   = state?.accountCategories   ||DEFAULT.accountCategories;
+
+  const netWorth = calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, marketPrices, tradeBalanceEffects);
+
+  // Bank accounts
+  const bankCatIds = accountCategories.filter(c=>c.name==="Bank"||c.id==="cat_bank").map(c=>c.id);
+  const bankAccs = accounts.filter(a=>!a.isCreditCard&&(bankCatIds.includes(a.account_type||a.categoryId)));
+  const bankTotal = bankAccs.reduce((s,a)=>s+toINR(calcBalance(a.id,transactions,accounts,tradeBalanceEffects),a.currency||"INR",fxRates),0);
+
+  // Cash + Wallet
+  const cashCatIds = accountCategories.filter(c=>["Cash","Wallet / UPI"].includes(c.name)||["cat_cash","cat_wallet"].includes(c.id)).map(c=>c.id);
+  const cashAccs = accounts.filter(a=>!a.isCreditCard&&cashCatIds.includes(a.account_type||a.categoryId));
+  const cashTotal = cashAccs.reduce((s,a)=>s+toINR(calcBalance(a.id,transactions,accounts,tradeBalanceEffects),a.currency||"INR",fxRates),0);
+
+  // Stocks
+  const stocks = holdings.filter(h=>h.type==="stock");
+  const stockTotal = stocks.reduce((s,h)=>{
+    const mp=marketPrices[h.symbol]?.current_price;
+    const qty=h.quantity||0;
+    return s+toINR(mp?mp*qty:(h.investedAmount||qty*(h.avgPrice||0)),h.currency||"INR",fxRates);
+  },0);
+
+  // Mutual Funds
+  const mfs = holdings.filter(h=>h.type==="mf");
+  const mfTotal = mfs.reduce((s,h)=>{
+    const mp=marketPrices[h.symbol]?.current_price;
+    const qty=h.units||0;
+    return s+toINR(mp?mp*qty:(h.investedAmount||qty*(h.nav||0)),h.currency||"INR",fxRates);
+  },0);
+
+  // Fixed Deposits — show invested amount only
+  const fdTotal = fixedDeposits.reduce((s,fd)=>s+toINR(parseFloat(fd.amount)||0,fd.currency||"INR",fxRates),0);
+
+  const rows = [
+    { label:"🏦 Bank Accounts",  value:bankTotal,  color:"#3B82F6" },
+    { label:"📊 Stocks",         value:stockTotal, color:"#6366F1" },
+    { label:"📈 Mutual Funds",   value:mfTotal,    color:"#10B981" },
+    { label:"🏦 Fixed Deposits", value:fdTotal,    color:"#F59E0B" },
+    { label:"💵 Cash & Wallets", value:cashTotal,  color:"#06B6D4" },
+  ];
+  const positiveTotal = rows.reduce((s,r)=>s+Math.max(0,r.value),0)||1;
+
+  return (
+    <Modal title="Net Worth Breakdown" onClose={onClose}>
+      <div style={{textAlign:"center",marginBottom:20,padding:"16px 0",background:"linear-gradient(135deg,#EEF2FF,#F5F3FF)",borderRadius:12}}>
+        <div style={{fontSize:12,color:"#64748B",fontWeight:600,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:4}}>Total Net Worth</div>
+        <div style={{fontSize:32,fontWeight:800,color:netWorth>=0?"#6366F1":"#EF4444"}}>{fmtINR(netWorth)}</div>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        {rows.map(row=>(
+          <div key={row.label} style={{background:"#F8FAFC",borderRadius:10,padding:"12px 14px"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+              <span style={{fontWeight:600,fontSize:14,color:"#0F172A"}}>{row.label}</span>
+              <span style={{fontWeight:800,fontSize:15,color:row.color}}>{fmtINR(row.value)}</span>
+            </div>
+            <div style={{background:"#E2E8F0",borderRadius:20,height:6,overflow:"hidden"}}>
+              <div style={{background:row.color,height:"100%",borderRadius:20,width:`${Math.min(100,Math.max(0,(row.value/positiveTotal)*100))}%`,transition:"width 0.4s"}}/>
+            </div>
+            <div style={{fontSize:11,color:"#94A3B8",marginTop:4}}>
+              {positiveTotal>0?`${((Math.max(0,row.value)/positiveTotal)*100).toFixed(1)}% of assets`:""}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div style={{marginTop:16}}>
+        <Btn variant="ghost" onClick={onClose} style={{width:"100%"}}>Close</Btn>
+      </div>
+    </Modal>
   );
 }
 
 // ─── DASHBOARD ────────────────────────────────────────────────────────────────
 function DashboardView({ state }) {
-  const transactions = state?.transactions||[];
-  const holdings     = state?.holdings    ||[];
-  const accounts     = state?.accounts    ||[];
-  const fxRates      = state?.fxRates     ||DEFAULT.fxRates;
+  const transactions        = state?.transactions        ||[];
+  const holdings            = state?.holdings            ||[];
+  const accounts            = state?.accounts            ||[];
+  const fxRates             = state?.fxRates             ||DEFAULT.fxRates;
+  const fixedDeposits       = state?.fixedDeposits       ||[];
+  const marketPrices        = state?.marketPrices        ||{};
+  const tradeBalanceEffects = state?.tradeBalanceEffects ||[];
   const allCats      = [...(state?.expenseCategories||[]),...(state?.incomeCategories||[])];
+  const [showNWBreakdown, setShowNWBreakdown] = useState(false);
 
   const now      = new Date();
   const monthTxs = transactions.filter(t=>{const d=new Date(t.date+"T00:00:00");return d.getMonth()===now.getMonth()&&d.getFullYear()===now.getFullYear();});
 
-  // Month income (exclude refund-income from totals, it's tracked separately)
-  const monthIn  = monthTxs.filter(t=>t.type==="income"&&!t.isRefund).reduce((s,t)=>s+toINR(t.amount,t.currency,fxRates),0);
-
-  // Month actual expense = total expense - refunded amounts
+  const monthIn = monthTxs.filter(t=>t.type==="income"&&!(t.isRefund||t.is_refund)).reduce((s,t)=>s+toINR(t.amount,t.currency,fxRates),0);
   const monthGrossOut = monthTxs.filter(t=>t.type==="expense").reduce((s,t)=>s+toINR(t.amount,t.currency,fxRates),0);
   const monthRefunded = monthTxs.filter(t=>t.type==="expense").reduce((s,t)=>s+toINR(parseFloat(t.refundedAmount)||0,t.currency,fxRates),0);
   const monthNetOut   = monthGrossOut - monthRefunded;
 
-  const portfolio = holdings.reduce((s,h)=>s+toINR(h.type==="stock"?h.quantity*h.avgPrice:h.units*h.nav,h.currency,fxRates),0);
-  const totalBal  = accounts.filter(a=>!a.isCreditCard).reduce((s,acc)=>s+toINR(calcBalance(acc.id,transactions,accounts),acc.currency||"INR",fxRates),0);
-  const netWorth  = calcNetWorth(accounts, transactions, fxRates);
-  const recentTx  = [...transactions].sort((a,b)=>new Date(b.date)-new Date(a.date)).slice(0,5);
+  // ── Centralized net worth — single source of truth ──────────────────────
+  const netWorth = calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, marketPrices, tradeBalanceEffects);
+  const recentTx = [...transactions].sort((a,b)=>new Date(b.date)-new Date(a.date)).slice(0,5);
 
-  // Cashback summary
+  // Portfolio value at market price if available
+  const portfolio = holdings.reduce((s,h)=>{
+    const mp=marketPrices[h.symbol]?.current_price;
+    const qty=h.quantity||h.units||0;
+    return s+toINR(mp?mp*qty:(h.investedAmount||qty*(h.avgPrice||h.nav||0)),h.currency,fxRates);
+  },0);
+
   const cbSummary = calcCashbackSummary(transactions, accounts);
   const totalCB   = Object.values(cbSummary).reduce((s,c)=>s+Object.values(c.tiers).reduce((a,t)=>a+t.expected,0),0);
 
   return (
     <div>
-      {/* Hero banner */}
+      {/* Hero banner — Net Worth as primary metric, no separate Balance card */}
       <div style={{background:"linear-gradient(135deg,#1E1B4B,#312E81,#4C1D95)",borderRadius:20,padding:"28px 24px",marginBottom:20,color:"#fff",position:"relative",overflow:"hidden"}}>
         <div style={{position:"absolute",top:-40,right:-40,width:200,height:200,borderRadius:"50%",background:"rgba(255,255,255,0.05)"}}/>
-        <div style={{fontSize:12,color:"rgba(255,255,255,0.6)",marginBottom:4,textTransform:"uppercase",letterSpacing:"0.1em",fontWeight:600}}>Total Balance (INR equiv.)</div>
-        <div style={{fontSize:36,fontWeight:800,letterSpacing:"-1px",marginBottom:4}}>{fmtINR(totalBal)}</div>
-        <div style={{fontSize:13,color:"rgba(255,255,255,0.7)",marginBottom:16}}>
-          Net Worth: <strong style={{color:"#A7F3D0"}}>{fmtINR(netWorth)}</strong>
-        </div>
+        <div style={{position:"absolute",bottom:-60,left:-30,width:180,height:180,borderRadius:"50%",background:"rgba(255,255,255,0.03)"}}/>
+        <div style={{fontSize:12,color:"rgba(255,255,255,0.6)",marginBottom:4,textTransform:"uppercase",letterSpacing:"0.1em",fontWeight:600}}>Total Net Worth</div>
+        <div style={{fontSize:36,fontWeight:800,letterSpacing:"-1px",marginBottom:8}}>{fmtINR(netWorth)}</div>
+        <button onClick={()=>setShowNWBreakdown(true)}
+          style={{background:"rgba(255,255,255,0.15)",border:"1px solid rgba(255,255,255,0.25)",borderRadius:20,padding:"5px 14px",color:"#fff",fontSize:12,cursor:"pointer",fontFamily:"inherit",fontWeight:600,marginBottom:16,backdropFilter:"blur(4px)"}}>
+          📊 View Breakdown ›
+        </button>
         <div style={{display:"flex",gap:20,flexWrap:"wrap"}}>
           <div><div style={{fontSize:11,color:"rgba(255,255,255,0.5)",marginBottom:2}}>Month In</div><div style={{fontSize:16,fontWeight:700,color:"#A7F3D0"}}>+{fmtINR(monthIn)}</div></div>
           <div><div style={{fontSize:11,color:"rgba(255,255,255,0.5)",marginBottom:2}}>Month Out (net)</div><div style={{fontSize:16,fontWeight:700,color:"#FCA5A5"}}>{fmtINR(monthNetOut)}</div></div>
@@ -1611,18 +2262,20 @@ function DashboardView({ state }) {
       {/* Stats grid — 2 col on mobile */}
       <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:12,marginBottom:20}}>
         {[
-          {label:"Month Income",   value:fmtINR(monthIn),         color:"#10B981",bg:"#F0FDF4",icon:"📥"},
-          {label:"Net Expense",    value:fmtINR(monthNetOut),      color:"#EF4444",bg:"#FEF2F2",icon:"📤"},
-          {label:"Net Worth",      value:fmtINR(netWorth),         color:netWorth>=0?"#6366F1":"#EF4444",bg:"#EEF2FF",icon:"💎"},
-          {label:"Expected CB",    value:fmtINR(totalCB),          color:"#D97706",bg:"#FFFBEB",icon:"💳"},
+          {label:"Month Income",  value:fmtINR(monthIn),    color:"#10B981",bg:"#F0FDF4",icon:"📥"},
+          {label:"Net Expense",   value:fmtINR(monthNetOut), color:"#EF4444",bg:"#FEF2F2",icon:"📤"},
+          {label:"Net Worth",     value:fmtINR(netWorth),    color:netWorth>=0?"#6366F1":"#EF4444",bg:"#EEF2FF",icon:"💎",clickable:true},
+          {label:"Expected CB",   value:fmtINR(totalCB),     color:"#D97706",bg:"#FFFBEB",icon:"💳"},
         ].map(s=>(
-          <Card key={s.label} style={{background:s.bg,padding:16}}>
+          <Card key={s.label} style={{background:s.bg,padding:16,cursor:s.clickable?"pointer":"default"}} onClick={s.clickable?()=>setShowNWBreakdown(true):undefined}>
             <div style={{fontSize:20,marginBottom:6}}>{s.icon}</div>
             <div style={{fontSize:18,fontWeight:800,color:s.color,marginBottom:4}}>{s.value}</div>
-            <div style={{fontSize:12,color:"#64748B",fontWeight:500}}>{s.label}</div>
+            <div style={{fontSize:12,color:"#64748B",fontWeight:500}}>{s.label}{s.clickable&&<span style={{color:s.color,marginLeft:4,fontSize:11}}> ›</span>}</div>
           </Card>
         ))}
       </div>
+
+      {showNWBreakdown&&<NetWorthBreakdownModal state={state} onClose={()=>setShowNWBreakdown(false)} />}
 
       {/* Cashback summary if any expected */}
       {Object.keys(cbSummary).length>0&&(
@@ -1676,42 +2329,58 @@ function DashboardView({ state }) {
   );
 }
 
+
 // ─── ACCOUNTS VIEW ────────────────────────────────────────────────────────────
 function AccountsView({ state, dispatch }) {
   const [showAdd,     setShowAdd]     = useState(false);
   const [showAccType, setShowAccType] = useState(false);
+
+  // Listen for FAB event
+  useEffect(()=>{
+    const h = ()=>setShowAdd(true);
+    document.addEventListener("wm:addAccount",h);
+    return ()=>document.removeEventListener("wm:addAccount",h);
+  },[]);
   const [showFx,      setShowFx]      = useState(false);
   const [editing,     setEditing]     = useState(null);
   const [ccSettings,  setCCSettings]  = useState(null);
+  // Per-category edit mode: { [catId]: boolean }
+  const [catEditMode, setCatEditMode] = useState({});
 
-  const accounts     = state?.accounts          ||[];
-  const accCats      = state?.accountCategories  ||DEFAULT.accountCategories;
-  const transactions = state?.transactions       ||[];
-  const fxRates      = state?.fxRates            ||DEFAULT.fxRates;
-  const byCategory   = accCats.map(cat=>({...cat,accounts:accounts.filter(a=>a.categoryId===cat.id)}));
+  const accounts            = state?.accounts          ||[];
+  const accCats             = state?.accountCategories  ||DEFAULT.accountCategories;
+  const transactions        = state?.transactions       ||[];
+  const fxRates             = state?.fxRates            ||DEFAULT.fxRates;
+  const holdings            = state?.holdings            ||[];
+  const fixedDeposits       = state?.fixedDeposits       ||[];
+  const marketPrices        = state?.marketPrices        ||{};
+  const tradeBalanceEffects = state?.tradeBalanceEffects ||[];
+  const byCategory          = accCats.map(cat=>({...cat,accounts:accounts.filter(a=>a.categoryId===cat.id)}));
 
   function toggleDisable(acc, shouldDisable) {
     if (shouldDisable) {
-      const isCCCard = acc.isCreditCard;
-      const bal = isCCCard ? (()=>{const{outstanding,payable}=calcCCBalance(acc,transactions);return outstanding+payable;})() : calcBalance(acc.id, transactions, accounts);
-      if (bal>=0.005) {
-        toast(`Cannot disable "${acc.name}" — balance ${fmtCur(bal,acc.currency||"INR")} must be 0`, "error");
-        return;
-      }
+      if (!window.confirm(`Disable "${acc.name}"? It will be hidden from new transactions but historical data is preserved.`)) return;
     }
-    dispatch({type:"EDIT_ACCOUNT",payload:{...acc,disabled:shouldDisable}});
+    dispatch({type:"EDIT_ACCOUNT",payload:{...acc, disabled:shouldDisable, is_active:!shouldDisable}});
     toast(shouldDisable ? "Account disabled" : "Account enabled");
   }
 
-  // Net worth summary row
-  const netWorth = calcNetWorth(accounts, transactions, fxRates);
+  function deleteAccount(acc) {
+    const hasTxns = transactions.some(t => t.accountId===acc.id || t.fromAccountId===acc.id || t.toAccountId===acc.id);
+    if (hasTxns) { toast(`"${acc.name}" has transactions — disable instead`, "error"); return; }
+    if (!window.confirm(`Permanently delete "${acc.name}"?`)) return;
+    dispatch({type:"DELETE_ACCOUNT",payload:acc.id});
+    toast("Account deleted");
+  }
+
+  const netWorth = calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, marketPrices, tradeBalanceEffects);
 
   return (
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:8}}>
         <h2 style={{margin:0,fontSize:22,fontWeight:800,color:"#0F172A"}}>Accounts</h2>
         <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-          <Btn variant="ghost" size="sm" onClick={()=>setShowFx(true)}>💱 FX Rates</Btn>
+          <Btn variant="ghost" size="sm" onClick={()=>setShowFx(true)}>💱 FX</Btn>
           <Btn variant="ghost" size="sm" onClick={()=>setShowAccType(true)}>⚙️ Types</Btn>
           <Btn size="sm" onClick={()=>setShowAdd(true)}>+ Account</Btn>
         </div>
@@ -1738,16 +2407,28 @@ function AccountsView({ state, dispatch }) {
         </Card>
       )}
       {byCategory.map(cat=>cat.accounts.length>0&&(
-        <div key={cat.id} style={{marginBottom:28}}>
-          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+        <div key={cat.id} style={{marginBottom:24}}>
+          {/* Category heading with Edit toggle */}
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
             <span style={{fontSize:18}}>{cat.icon}</span>
-            <span style={{fontWeight:700,color:"#475569",fontSize:14,textTransform:"uppercase",letterSpacing:"0.05em"}}>{cat.name}</span>
+            <span style={{fontWeight:700,color:"#475569",fontSize:14,textTransform:"uppercase",letterSpacing:"0.05em",flex:1}}>{cat.name}</span>
+            {catEditMode[cat.id] ? (
+              <button onClick={()=>setCatEditMode(p=>({...p,[cat.id]:false}))}
+                style={{fontSize:12,padding:"3px 10px",borderRadius:7,border:"1.5px solid #A7F3D0",background:"#F0FDF4",color:"#065F46",cursor:"pointer",fontFamily:"inherit",fontWeight:700}}>✓ Done</button>
+            ) : (
+              <button onClick={()=>setCatEditMode(p=>({...p,[cat.id]:true}))}
+                style={{fontSize:12,padding:"3px 10px",borderRadius:7,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>✏️ Edit</button>
+            )}
           </div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(min(100%,260px),1fr))",gap:12}}>
+          {/* Compact 2-col grid */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(min(100%,180px),1fr))",gap:8}}>
             {cat.accounts.map(acc=>(
               <AccountCard key={acc.id} acc={acc} transactions={transactions} accounts={accounts} fxRates={fxRates}
+                tradeBalanceEffects={tradeBalanceEffects}
+                editMode={!!catEditMode[cat.id]}
                 onEdit={a=>setEditing(a)}
                 onToggle={toggleDisable}
+                onDelete={deleteAccount}
                 onCCSettings={a=>setCCSettings(a)}
               />
             ))}
@@ -1839,123 +2520,1806 @@ function TransactionsView({ state, dispatch }) {
   );
 }
 
+
+// ─── SYMBOL SEARCH via Yahoo Finance autocomplete ────────────────────────────
+// Uses Yahoo Finance's autocomplete endpoint via allorigins proxy.
+// Works from localhost and production alike.
+async function searchGoogleFinance(query) {
+  if (!query || query.length < 1) return [];
+  try {
+    const yUrl = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(query)}&quotesCount=10&newsCount=0&listsCount=0`;
+    const raw = await _fetchViaProxy(yUrl);
+    if (!raw) return [];
+    let data;
+    try { data = JSON.parse(raw); } catch { return []; }
+    return (data?.quotes || [])
+      .filter(q => q.symbol && (q.exchange || q.exchDisp))
+      .map(q => ({
+        symbol:   q.symbol,
+        name:     q.longname || q.shortname || q.symbol,
+        exchange: q.exchDisp || q.exchange || "",
+        type:     (q.quoteType || "").toLowerCase().includes("fund") ||
+                  (q.quoteType || "").toLowerCase().includes("etf")  ? "mf" : "stock",
+      }));
+  } catch { return []; }
+}
+
+// ─── STOCKS MASTER MODAL ─────────────────────────────────────────────────────
+// Manages the Stocks Master Table. Shows all stocks, allows search-add, edit name, delete.
+function StocksMasterModal({ state, dispatch, onClose }) {
+  const stocks = state?.stocks || [];
+  const [search, setSearch] = useState("");
+  const [query,  setQuery]  = useState("");
+  const [suggestions, setSuggestions] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [searchFailed, setSearchFailed] = useState(false);
+  const [manualName, setManualName] = useState("");
+  const [manualType, setManualType] = useState("stock");
+  const [editStock, setEditStock] = useState(null);
+  const [editName,  setEditName]  = useState("");
+
+  const searchTimer = useRef(null);
+
+  function onQueryChange(val) {
+    setQuery(val);
+    setSearchFailed(false);
+    setSuggestions([]);
+    clearTimeout(searchTimer.current);
+    if (val.length < 1) return;
+    searchTimer.current = setTimeout(async () => {
+      setSearching(true);
+      const results = await searchGoogleFinance(val);
+      setSuggestions(results);
+      setSearching(false);
+      if (results.length === 0) setSearchFailed(true);
+    }, 400);
+  }
+
+  function addManualStock() {
+    const sym = query.trim().toUpperCase();
+    const nm  = manualName.trim() || sym;
+    if (!sym) { toast("Enter a symbol", "error"); return; }
+    if (stocks.find(st => st.symbol === sym)) { toast(`${sym} already in master`, "error"); return; }
+    dispatch({ type:"ADD_STOCK", payload:{ id:uid(), symbol:sym, name:nm, type:manualType, exchange:"" } });
+    toast(`${sym} added to Stocks Master`);
+    setQuery(""); setManualName(""); setSuggestions([]); setSearchFailed(false);
+  }
+
+  function addStock(s) {
+    if (stocks.find(st => st.symbol === s.symbol)) { toast(`${s.symbol} already in master`, "error"); return; }
+    dispatch({ type:"ADD_STOCK", payload:{ id:uid(), symbol:s.symbol, name:s.name, type:s.type||"stock", exchange:s.exchange } });
+    toast(`${s.symbol} added to Stocks Master`);
+    setQuery(""); setSuggestions([]);
+  }
+
+  function deleteStock(st) {
+    const inUse = (state?.investmentTx||[]).some(t => t.symbol===st.symbol);
+    if (inUse) { toast(`${st.symbol} has trades — cannot delete`, "error"); return; }
+    if (!window.confirm(`Remove ${st.symbol} from Stocks Master?`)) return;
+    dispatch({ type:"DELETE_STOCK", payload: st.id });
+    toast(`${st.symbol} removed`);
+  }
+
+  function startEditName(st) { setEditStock(st); setEditName(st.name); }
+
+  function saveEditName() {
+    if (!editName.trim()) return;
+    dispatch({ type:"EDIT_STOCK", payload:{...editStock, name:editName.trim()} });
+    // Also update holdings name
+    (state?.holdings||[]).filter(h=>h.symbol===editStock.symbol).forEach(h=>{
+      dispatch({ type:"RENAME_STOCK", payload:{oldSymbol:editStock.symbol, newSymbol:editStock.symbol, newName:editName.trim()} });
+    });
+    toast("Name updated"); setEditStock(null);
+  }
+
+  const filtered = stocks.filter(st =>
+    !search || st.symbol.toLowerCase().includes(search.toLowerCase()) || st.name.toLowerCase().includes(search.toLowerCase())
+  );
+
+  return (
+    <Modal title="📚 Stocks Master" onClose={onClose}>
+      {/* Search to add new */}
+      <div style={{position:"relative",marginBottom:16}}>
+        <label style={{display:"block",fontSize:12,fontWeight:600,color:"#64748B",marginBottom:6,textTransform:"uppercase",letterSpacing:"0.05em"}}>Search &amp; Add Symbol</label>
+        <input value={query} onChange={e=>onQueryChange(e.target.value)}
+          placeholder="Type NSE:ITBEES, TCS, ICICI…"
+          style={{...inputStyle,paddingRight:40}}
+          onFocus={e=>e.target.style.borderColor="#6366F1"}
+          onBlur={e=>e.target.style.borderColor="#E2E8F0"} />
+        {searching && <div style={{position:"absolute",right:12,top:38,fontSize:12,color:"#94A3B8"}}>🔍…</div>}
+        {suggestions.length>0 && (
+          <div style={{position:"absolute",left:0,right:0,top:"100%",background:"#fff",border:"1.5px solid #E2E8F0",borderRadius:10,zIndex:500,boxShadow:"0 8px 24px rgba(0,0,0,0.12)",maxHeight:240,overflowY:"auto"}}>
+            {suggestions.map((s,i)=>(
+              <button key={i} onClick={()=>addStock(s)}
+                style={{display:"block",width:"100%",textAlign:"left",padding:"10px 14px",border:"none",background:"none",cursor:"pointer",borderBottom:i<suggestions.length-1?"1px solid #F1F5F9":"none",fontFamily:"inherit"}}>
+                <div style={{fontWeight:700,fontSize:13,color:"#0F172A"}}>{s.exchange?`${s.exchange}:${s.symbol}`:s.symbol}</div>
+                <div style={{fontSize:11,color:"#64748B"}}>{s.name} · {s.type==="mf"?"Mutual Fund":"Stock"}</div>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      {/* Manual add fallback when search returns nothing */}
+      {searchFailed && query.length>=2 && (
+        <div style={{background:"#F8FAFC",border:"1.5px solid #E2E8F0",borderRadius:10,padding:12,marginBottom:12}}>
+          <div style={{fontSize:12,color:"#64748B",marginBottom:8}}>⚠️ Online search unavailable — add manually:</div>
+          <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+            <div style={{flex:"1 1 140px"}}>
+              <div style={{fontSize:11,color:"#94A3B8",marginBottom:3}}>Symbol (from search box)</div>
+              <div style={{fontWeight:700,fontSize:13,color:"#0F172A",padding:"6px 10px",background:"#EEF2FF",borderRadius:7}}>{query.toUpperCase()}</div>
+            </div>
+            <div style={{flex:"2 1 180px"}}>
+              <div style={{fontSize:11,color:"#94A3B8",marginBottom:3}}>Name</div>
+              <input value={manualName} onChange={e=>setManualName(e.target.value)} placeholder="e.g. Tata Consultancy Services"
+                style={{...inputStyle,padding:"6px 10px",fontSize:13}}
+                onFocus={e=>e.target.style.borderColor="#6366F1"} onBlur={e=>e.target.style.borderColor="#E2E8F0"} />
+            </div>
+            <div style={{flex:"1 1 100px"}}>
+              <div style={{fontSize:11,color:"#94A3B8",marginBottom:3}}>Type</div>
+              <select value={manualType} onChange={e=>setManualType(e.target.value)}
+                style={{...inputStyle,padding:"6px 10px",fontSize:13}}>
+                <option value="stock">Stock</option>
+                <option value="mf">Mutual Fund</option>
+              </select>
+            </div>
+            <button onClick={addManualStock}
+              style={{alignSelf:"flex-end",padding:"7px 14px",borderRadius:8,border:"none",background:"#6366F1",color:"#fff",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit",flexShrink:0}}>
+              + Add
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Filter existing */}
+      <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍 Filter master list…"
+        style={{...inputStyle,marginBottom:12}}
+        onFocus={e=>e.target.style.borderColor="#6366F1"}
+        onBlur={e=>e.target.style.borderColor="#E2E8F0"} />
+
+      {filtered.length===0 ? (
+        <div style={{textAlign:"center",padding:32,color:"#94A3B8"}}>
+          <div style={{fontSize:36}}>📚</div>
+          <div style={{marginTop:8}}>No stocks in master yet</div>
+          <div style={{fontSize:12,marginTop:4}}>Search above to add stocks (or add manually if offline)</div>
+        </div>
+      ) : (
+        <div style={{display:"flex",flexDirection:"column",gap:0}}>
+          {filtered.map(st=>(
+            <div key={st.id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 0",borderBottom:"1px solid #F1F5F9"}}>
+              <div style={{flex:1,minWidth:0}}>
+                {editStock?.id===st.id ? (
+                  <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                    <input value={editName} onChange={e=>setEditName(e.target.value)}
+                      style={{...inputStyle,padding:"6px 10px",fontSize:13,flex:1}}
+                      onFocus={e=>e.target.style.borderColor="#6366F1"}
+                      onBlur={e=>e.target.style.borderColor="#E2E8F0"} />
+                    <button onClick={saveEditName} style={{padding:"5px 10px",borderRadius:7,border:"none",background:"#6366F1",color:"#fff",cursor:"pointer",fontWeight:700,fontSize:12}}>✓</button>
+                    <button onClick={()=>setEditStock(null)} style={{padding:"5px 10px",borderRadius:7,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#64748B",cursor:"pointer",fontSize:12}}>✕</button>
+                  </div>
+                ) : (
+                  <>
+                    <div style={{fontWeight:700,fontSize:13,color:"#0F172A"}}>{st.symbol}</div>
+                    <div style={{fontSize:11,color:"#64748B"}}>{st.name} · {st.exchange||""} · {st.type==="mf"?"MF":"Stock"}</div>
+                  </>
+                )}
+              </div>
+              {editStock?.id!==st.id && (
+                <>
+                  <button onClick={()=>startEditName(st)}
+                    style={{fontSize:11,padding:"3px 8px",borderRadius:7,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>✏️</button>
+                  <button onClick={()=>deleteStock(st)}
+                    style={{fontSize:11,padding:"3px 8px",borderRadius:7,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>🗑️</button>
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      <div style={{marginTop:16}}>
+        <Btn variant="ghost" onClick={onClose} style={{width:"100%"}}>Close</Btn>
+      </div>
+    </Modal>
+  );
+}
+
+// ─── INVESTMENT MODAL (Trade Entry) ──────────────────────────────────────────
+// Features: stock/MF/FD, money-source account, symbol search via Google Finance,
+//           stocks master enforcement, NAV label for MF, edit mode
+function InvestModal({ state, onClose, onSave, editTx }) {
+  const isEdit   = !!editTx;
+  const allAccs  = (state?.accounts||[]).filter(a=>!a.disabled);
+  const accTypes = state?.accountCategories || DEFAULT.accountCategories;
+  const investType = accTypes.find(t => t.isInvestmentType);
+  const investAccs  = investType ? allAccs.filter(a=>a.categoryId===investType.id) : allAccs;
+  const sourceAccs  = investType ? allAccs.filter(a=>a.categoryId!==investType.id) : allAccs;
+  const masterStocks = state?.stocks || [];
+
+  const [txType,  setTxType]  = useState(editTx?.type       || "buy");
+  const [invType, setInvType] = useState(editTx?.invType     || "stock");
+  const [symbol,  setSymbol]  = useState(editTx?.symbol      || "");
+  const [name,    setName]    = useState(editTx?.name        || "");
+  const [qty,     setQty]     = useState(editTx ? String(editTx.quantity) : "");
+  const [price,   setPrice]   = useState(editTx ? String(editTx.price)    : "");
+  const [cur,     setCur]     = useState(editTx?.currency    || "INR");
+  const [date,    setDate]    = useState(editTx?.date        || new Date().toISOString().split("T")[0]);
+  const [invAccId,setInvAccId]= useState(editTx?.accountId   || investAccs[0]?.id||"");
+  const [srcAccId,setSrcAccId]= useState(editTx?.sourceAccountId || sourceAccs[0]?.id||"");
+  const [brok,    setBrok]    = useState(editTx ? String(editTx.brokerage||0) : "0");
+  const [note,    setNote]    = useState(editTx?.note        || "");
+  const [fetching,setFetching]= useState(false);
+  const [priceHint,setPriceHint]=useState("");
+  const [symQuery,  setSymQuery]    = useState(editTx?.symbol||"");
+  const [symSugg,   setSymSugg]     = useState([]);
+  const [symSearching, setSymSearching] = useState(false);
+  const [showSugg, setShowSugg]     = useState(false);
+  const symTimer = useRef(null);
+
+  const [fdAmount,   setFdAmount]    = useState(editTx?.fdAmount||"");
+  const [fdInvDate,  setFdInvDate]   = useState(editTx?.investedDate||date);
+  const [fdMatDate,  setFdMatDate]   = useState(editTx?.maturityDate||"");
+  const [fdRate,     setFdRate]      = useState(editTx?.interestRate||"");
+
+  const isFD  = invType==="fd";
+  const isMF  = invType==="mf";
+  const total = isFD ? parseFloat(fdAmount)||0 : (parseFloat(qty)||0)*(parseFloat(price)||0);
+  const curObj= CURRENCIES.find(c=>c.code===cur)||CURRENCIES[0];
+  const masterMatch = masterStocks.find(st=>st.symbol===symbol);
+  const existingHolding = (state?.holdings||[]).find(h=>
+    h.symbol===symbol && h.accountId===invAccId && h.type===invType);
+
+  function onSymQueryChange(val) {
+    setSymQuery(val);
+    setSymbol(val.toUpperCase());
+    clearTimeout(symTimer.current);
+    if (val.length < 1) { setSymSugg([]); setShowSugg(false); return; }
+    // Always show master matches immediately
+    const masterMatches = masterStocks.filter(st=>
+      st.symbol.toLowerCase().includes(val.toLowerCase()) ||
+      st.name.toLowerCase().includes(val.toLowerCase())
+    ).map(st=>({...st,fromMaster:true}));
+    setSymSugg(masterMatches);
+    setShowSugg(masterMatches.length > 0);
+    // Then augment with live search after short delay
+    symTimer.current = setTimeout(async () => {
+      setSymSearching(true);
+      const gfResults = await searchGoogleFinance(val);
+      setSymSugg(prev => {
+        const masterSyms = prev.filter(s=>s.fromMaster).map(s=>s.symbol);
+        const newGf = gfResults.filter(s=>!masterSyms.includes(s.symbol));
+        const combined = [...prev.filter(s=>s.fromMaster), ...newGf];
+        setShowSugg(combined.length > 0);
+        return combined;
+      });
+      setSymSearching(false);
+    }, 500);
+  }
+
+  function selectSymbol(s) {
+    const sym = (s.symbol||"").toUpperCase();
+    setSymbol(sym); setSymQuery(sym);
+    if (s.name) setName(s.name);
+    setShowSugg(false); setSymSugg([]);
+  }
+
+  function lookupPrice() {
+    setPriceHint("Live price unavailable — enter price manually");
+  }
+
+  function save() {
+    if (isFD) {
+      if (!fdAmount||!fdInvDate||!fdMatDate||!fdRate) { toast("Fill all FD fields","error"); return; }
+      const fd = {
+        id:editTx?.id||uid(), type:"fd", invType:"fd",
+        name:name||symbol||"Fixed Deposit", symbol:symbol||"FD",
+        amount:parseFloat(fdAmount), investedDate:fdInvDate, maturityDate:fdMatDate,
+        interestRate:parseFloat(fdRate), accountId:invAccId, sourceAccountId:srcAccId,
+        currency:cur, date:fdInvDate, note,
+      };
+      onSave({fd,isFD:true}); toast(isEdit?"FD updated":"FD added"); onClose(); return;
+    }
+    if (!symbol||!qty||!price) { toast("Fill symbol, qty, price","error"); return; }
+    const masterSt = masterStocks.find(st=>st.symbol===symbol);
+    if (!masterSt && !isEdit) { toast("Add stock to Stocks Master first (📚 Master)","error"); return; }
+    const q=parseFloat(qty), p=parseFloat(price), b=parseFloat(brok)||0;
+    const holdingId = existingHolding?.id || editTx?.holdingId || uid();
+    const itx = {
+      id:editTx?.id||uid(), holdingId, type:txType,
+      invType:masterSt?.type||invType, symbol, name:name||masterSt?.name||symbol,
+      quantity:q, price:p, currency:cur, date, accountId:invAccId,
+      sourceAccountId:srcAccId, brokerage:b, note,
+    };
+    const newHolding = (!existingHolding && txType==="buy") ? {
+      id:holdingId, symbol, name:name||masterSt?.name||symbol,
+      type:masterSt?.type||invType, accountId:invAccId, currency:cur,
+      lots:[], quantity:0, units:0, avgPrice:0, investedAmount:0,
+    } : null;
+    const autoAddStock = !masterSt ? {id:uid(),symbol,name:name||symbol,type:invType,exchange:""} : null;
+    onSave({itx,newHolding,isFD:false,autoAddStock});
+    toast(isEdit?"Trade updated":txType==="buy"?"Buy recorded":"Sell recorded");
+    onClose();
+  }
+
+  return (
+    <Modal title={isEdit?"Edit Trade":"Add Trade / Investment"} onClose={onClose}>
+      <div style={{display:"flex",gap:6,marginBottom:14,overflowX:"auto",paddingBottom:2}}>
+        {[["stock","📊 Stock"],["mf","📈 Mutual Fund"],["fd","🏦 Fixed Deposit"]].map(([v,l])=>(
+          <button key={v} onClick={()=>setInvType(v)}
+            style={{flexShrink:0,padding:"7px 14px",borderRadius:18,border:`2px solid ${invType===v?"#6366F1":"#E2E8F0"}`,background:invType===v?"#EEF2FF":"#fff",color:invType===v?"#6366F1":"#64748B",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>{l}</button>
+        ))}
+      </div>
+      {!isFD&&(
+        <div style={{display:"flex",gap:8,marginBottom:14}}>
+          {[["buy","📥 Buy","#10B981","#F0FDF4"],["sell","📤 Sell","#EF4444","#FEF2F2"]].map(([v,l,col,bg])=>(
+            <button key={v} onClick={()=>setTxType(v)}
+              style={{flex:1,padding:"9px",borderRadius:10,border:`2px solid ${txType===v?col:"#E2E8F0"}`,background:txType===v?bg:"#fff",color:txType===v?col:"#64748B",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"inherit"}}>{l}</button>
+          ))}
+        </div>
+      )}
+      {!isFD && (investAccs.length>0
+        ? <Sel label="Investment Account (Broker)" value={invAccId} onChange={e=>setInvAccId(e.target.value)}>
+            {investAccs.map(a=><option key={a.id} value={a.id}>{a.icon} {a.name}</option>)}
+          </Sel>
+        : <div style={{background:"#FFFBEB",border:"1.5px solid #FDE68A",borderRadius:10,padding:10,marginBottom:14,fontSize:13,color:"#92400E"}}>
+            ⚠️ No investment accounts yet — create one under Accounts → Account Types → Investment
+          </div>
+      )}
+      {(txType==="buy"||isFD)&&(
+        <Sel label={isFD ? "Source Account (Bank / Wallet)" : "Money Source Account"} value={srcAccId} onChange={e=>setSrcAccId(e.target.value)}>
+          <option value="">— None / Unknown —</option>
+          {(isFD ? allAccs : sourceAccs).map(a=><option key={a.id} value={a.id}>{a.icon} {a.name} ({a.currency||"INR"})</option>)}
+        </Sel>
+      )}
+      {isFD ? (
+        <>
+          <Inp label="FD Name / Bank" value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. SBI FD 2024" />
+          <Inp label="Invested Amount" type="number" value={fdAmount} onChange={e=>setFdAmount(e.target.value)} placeholder="0.00" />
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+            <Inp label="Invested Date" type="date" value={fdInvDate} onChange={e=>setFdInvDate(e.target.value)} />
+            <Inp label="Maturity Date" type="date" value={fdMatDate} onChange={e=>setFdMatDate(e.target.value)} />
+          </div>
+          <Inp label="Interest Rate (% p.a.)" type="number" value={fdRate} onChange={e=>setFdRate(e.target.value)} placeholder="e.g. 7.5" />
+          {fdAmount&&fdRate&&fdInvDate&&fdMatDate&&(()=>{
+            const r=calcFDReturns({amount:fdAmount,interestRate:fdRate,investedDate:fdInvDate,maturityDate:fdMatDate});
+            return <div style={{background:"#F0FDF4",border:"1.5px solid #A7F3D0",borderRadius:10,padding:12,marginBottom:14,fontSize:13}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><span style={{color:"#64748B"}}>Interest (at maturity)</span><strong style={{color:"#10B981"}}>+{fmtCur(r.interest,cur)}</strong></div>
+              <div style={{display:"flex",justifyContent:"space-between"}}><span style={{color:"#64748B"}}>Maturity Value</span><strong>{fmtCur(r.maturityValue,cur)}</strong></div>
+              <div style={{fontSize:11,color:"#94A3B8",marginTop:6}}>FD shows invested amount only. Add interest as income on maturity.</div>
+            </div>;
+          })()}
+        </>
+      ) : (
+        <>
+          <div style={{position:"relative",marginBottom:14}}>
+            <label style={{display:"block",fontSize:12,fontWeight:600,color:"#64748B",marginBottom:6,textTransform:"uppercase",letterSpacing:"0.05em"}}>
+              {isMF?"Fund Code / NAV Symbol":"Symbol (e.g. NSE:ITBEES, TCS)"}
+            </label>
+            <div style={{display:"flex",gap:6}}>
+              <div style={{flex:1,position:"relative"}}>
+                <input value={symQuery} onChange={e=>onSymQueryChange(e.target.value)}
+                  onFocus={()=>symSugg.length>0&&setShowSugg(true)}
+                  onBlur={()=>setTimeout(()=>setShowSugg(false),200)}
+                  placeholder={isMF?"MUTF_IN:ICIC_PRUN, Mirae…":"NSE:ITBEES, TCS, RELIANCE…"}
+                  style={{...inputStyle}} />
+                {symSearching&&<div style={{position:"absolute",right:10,top:"50%",transform:"translateY(-50%)",fontSize:11,color:"#94A3B8"}}>🔍</div>}
+                {showSugg&&symSugg.length>0&&(
+                  <div style={{position:"absolute",left:0,right:0,top:"100%",background:"#fff",border:"1.5px solid #E2E8F0",borderRadius:10,zIndex:600,boxShadow:"0 8px 24px rgba(0,0,0,0.12)",maxHeight:200,overflowY:"auto"}}>
+                    {symSugg.map((s,i)=>(
+                      <button key={i} onMouseDown={()=>selectSymbol(s)}
+                        style={{display:"block",width:"100%",textAlign:"left",padding:"9px 12px",border:"none",background:s.fromMaster?"#F0FDF4":"#fff",cursor:"pointer",borderBottom:i<symSugg.length-1?"1px solid #F1F5F9":"none",fontFamily:"inherit"}}>
+                        <div style={{display:"flex",alignItems:"center",gap:6}}>
+                          {s.fromMaster&&<span style={{fontSize:9,background:"#10B981",color:"#fff",padding:"1px 5px",borderRadius:6,fontWeight:700}}>MASTER</span>}
+                          <span style={{fontWeight:700,fontSize:13,color:"#0F172A"}}>{s.exchange&&!s.fromMaster?`${s.exchange}:`:""}  {s.symbol}</span>
+                        </div>
+                        <div style={{fontSize:11,color:"#64748B"}}>{s.name}</div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <button onClick={lookupPrice} disabled={fetching||!symbol}
+                style={{padding:"0 12px",borderRadius:10,border:"1.5px solid #C7D2FE",background:"#EEF2FF",color:"#6366F1",cursor:symbol?"pointer":"not-allowed",fontFamily:"inherit",fontWeight:600,fontSize:12,flexShrink:0,opacity:symbol?1:0.5}}>
+                {fetching?"…":"💰"}
+              </button>
+            </div>
+            {priceHint&&<div style={{fontSize:11,color:"#6366F1",marginTop:4}}>{priceHint}</div>}
+            {symbol&&(
+              masterMatch
+                ? <div style={{fontSize:11,color:"#10B981",marginTop:3}}>✅ {masterMatch.name}</div>
+                : <div style={{fontSize:11,color:"#F59E0B",marginTop:3}}>⚠️ Not in Stocks Master — select from suggestions or add via 📚 Master</div>
+            )}
+          </div>
+          <Inp label="Full Name (optional)" value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. Tata Consultancy Services" />
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+            <Inp label={isMF?"Units":"Shares"} type="number" inputMode="decimal" value={qty} onChange={e=>setQty(e.target.value)} />
+            <Inp label={isMF?`NAV (${cur})`:`Price (${cur})`} type="number" inputMode="decimal" value={price} onChange={e=>setPrice(e.target.value)} />
+          </div>
+          {total>0&&(
+            <div style={{background:"#F0FDF4",border:"1.5px solid #A7F3D0",borderRadius:10,padding:10,marginBottom:14,fontSize:13,color:"#065F46"}}>
+              Total: <strong>{curObj.symbol}{fmtNum(total)}</strong>
+              {cur!=="INR"&&state?.fxRates?.[cur]?` ≈ ${fmtINR(total*state.fxRates[cur])}`:""} 
+            </div>
+          )}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+            <Inp label={`Brokerage (${cur})`} type="number" inputMode="decimal" value={brok} onChange={e=>setBrok(e.target.value)} />
+            <Inp label="Trade Date" type="date" value={date} onChange={e=>setDate(e.target.value)} />
+          </div>
+        </>
+      )}
+      <Sel label="Currency" value={cur} onChange={e=>setCur(e.target.value)}>
+        {CURRENCIES.map(c=><option key={c.code} value={c.code}>{c.symbol} {c.code} — {c.name}</option>)}
+      </Sel>
+      <Inp label="Note" value={note} onChange={e=>setNote(e.target.value)} placeholder="Optional…" />
+      <BtnRow>
+        <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+        <Btn variant={txType==="sell"?"danger":"success"} onClick={save}>{isEdit?"Save Changes":isFD?"Add FD":txType==="buy"?"Buy":"Sell"}</Btn>
+      </BtnRow>
+    </Modal>
+  );
+}
+
+// ─── TRADE HISTORY MODAL (per-symbol) ────────────────────────────────────────
+// Opens from HoldingRow "View Trade History" button or from global history tab.
+function TradeHistoryModal({ symbol, holding, investmentTx, accounts, state, dispatch, onClose }) {
+  const [editTrade, setEditTrade] = useState(null);
+  // Fix: filter by symbol OR holdingId to catch all trades for this stock
+  const trades = (investmentTx||[])
+    .filter(t => {
+      if (holding) return t.holdingId===holding.id || t.symbol===holding.symbol;
+      return t.symbol===symbol;
+    })
+    .sort((a,b)=>new Date(b.date)-new Date(a.date));
+
+  function deleteTrade(t) {
+    if (!window.confirm("Delete this trade? Holdings and balances will be recalculated.")) return;
+    dispatch({type:"DELETE_INVESTMENT_TX", payload:t.id});
+    toast("Trade deleted — holdings recalculated");
+  }
+
+  return (
+    <Modal title={`Trade History${symbol?` · ${symbol}`:""}`} onClose={onClose}>
+      {trades.length===0?(
+        <div style={{textAlign:"center",padding:32,color:"#94A3B8"}}>
+          <div style={{fontSize:40}}>📭</div>
+          <div style={{marginTop:8,fontWeight:600}}>No trades yet</div>
+        </div>
+      ):(
+        <div style={{display:"flex",flexDirection:"column",gap:0}}>
+          {trades.map(t=>{
+            const srcAcc = (accounts||[]).find(a=>a.id===t.sourceAccountId);
+            const total  = (parseFloat(t.quantity)||0)*(parseFloat(t.price)||0);
+            const cur    = t.currency||"INR";
+            return (
+              <div key={t.id} style={{padding:"12px 0",borderBottom:"1px solid #F1F5F9"}}>
+                <div style={{display:"flex",alignItems:"flex-start",gap:10}}>
+                  <span style={{fontSize:11,background:t.type==="buy"?"#F0FDF4":"#FEF2F2",color:t.type==="buy"?"#10B981":"#EF4444",padding:"3px 8px",borderRadius:10,fontWeight:700,flexShrink:0,marginTop:2}}>{t.type.toUpperCase()}</span>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontWeight:700,fontSize:14,color:"#0F172A"}}>{fmtNum(t.quantity)} × {fmtCur(t.price,cur)}</div>
+                    <div style={{fontSize:12,color:"#64748B",marginTop:2}}>{fmtDate(t.date)}{srcAcc?` · ${srcAcc.name}`:""}{t.note?` · ${t.note}`:""}</div>
+                  </div>
+                  <div style={{textAlign:"right",flexShrink:0}}>
+                    <div style={{fontWeight:700,fontSize:14,color:t.type==="buy"?"#EF4444":"#10B981"}}>
+                      {t.type==="buy"?"−":"+"}{ fmtCur(total,cur)}
+                    </div>
+                    <div style={{fontSize:10,color:"#94A3B8",marginTop:2}}>total</div>
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:8,marginTop:10}}>
+                  <button onClick={()=>setEditTrade(t)}
+                    style={{flex:1,fontSize:12,padding:"7px 0",borderRadius:8,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+                    ✏️ Edit
+                  </button>
+                  <button onClick={()=>deleteTrade(t)}
+                    style={{flex:1,fontSize:12,padding:"7px 0",borderRadius:8,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+                    🗑️ Delete
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      <div style={{marginTop:16}}>
+        <Btn variant="ghost" onClick={onClose} style={{width:"100%"}}>Close</Btn>
+      </div>
+      {editTrade&&(
+        <InvestModal
+          state={state}
+          editTx={editTrade}
+          onClose={()=>setEditTrade(null)}
+          onSave={({itx})=>{
+            dispatch({type:"EDIT_INVESTMENT_TX",payload:itx});
+            setEditTrade(null);
+            toast("Trade updated — holdings recalculated");
+          }}
+        />
+      )}
+    </Modal>
+  );
+}
+
+// ─── HOLDINGS ROW (expandable — View Trade History, no inline Edit) ───────────
+function HoldingRow({ holding, investmentTx, accounts, state, dispatch, openId, onToggle, bulkSelectMode=false, isSelected=false, onBulkSelect }) {
+  const isOpen = openId===holding.id;
+  const [showHistory, setShowHistory] = useState(false);
+  const [showPriceInput, setShowPriceInput] = useState(false);
+  const [manualPriceVal, setManualPriceVal] = useState("");
+  const [priceLoading, setPriceLoading] = useState(false);
+  const [showRename, setShowRename] = useState(false);
+  const [renameSymbol, setRenameSymbol] = useState(holding.symbol);
+  const [renameName,   setRenameName]   = useState(holding.name||"");
+
+  const cur = holding.currency||"INR";
+  const qty = holding.quantity||holding.units||0;
+  const avgPrice = holding.avgPrice||holding.nav||0;
+  const investedAmt = holding.investedAmount || qty*avgPrice;
+
+  const marketPrices = state?.marketPrices||{};
+  const cachedPrice  = marketPrices[holding.symbol]?.current_price;
+  const livePrice    = cachedPrice || null;
+
+  const currentVal  = livePrice ? livePrice*qty : investedAmt;
+  const totalDiff   = livePrice ? currentVal - investedAmt : 0;
+  const pctDiff     = investedAmt>0 ? (totalDiff/investedAmt)*100 : 0;
+  const fxRates     = state?.fxRates||DEFAULT.fxRates;
+  const broker      = accounts.find(a=>a.id===holding.accountId);
+  const tradeCount  = (investmentTx||[]).filter(t=>t.holdingId===holding.id || t.symbol===holding.symbol).length;
+
+  function saveManualPrice() {
+    const p = parseFloat(manualPriceVal);
+    if (!p || p <= 0) { toast("Enter a valid price", "error"); return; }
+    dispatch({ type:"UPDATE_MARKET_PRICE", payload:{ symbol:holding.symbol, current_price:p } });
+    toast(`Price set: ₹${p}`);
+    setShowPriceInput(false); setManualPriceVal("");
+  }
+
+  async function loadLivePrice() {
+    setPriceLoading(true);
+    const p = await fetchLivePrice(holding.symbol);
+    setPriceLoading(false);
+    if (p && p > 0) {
+      dispatch({ type:"UPDATE_MARKET_PRICE", payload:{ symbol:holding.symbol, current_price:p } });
+      toast(`Live price: ₹${p.toFixed(2)}`);
+    } else {
+      toast("Could not fetch price — try setting manually", "error");
+      setShowPriceInput(true);
+    }
+  }
+
+  function deleteSingleHolding() {
+    const count = (investmentTx||[]).filter(t=>t.symbol===holding.symbol).length;
+    if (!window.confirm(
+      `⚠️ Delete ENTIRE holding: ${holding.symbol}?\n\n` +
+      `This will permanently remove:\n` +
+      `• All ${count} trade(s) for this stock\n` +
+      `• The holding entry\n` +
+      `• Related corporate actions\n\n` +
+      `To delete a single trade, use "Trade History" instead.\n` +
+      `This action cannot be undone.`
+    )) return;
+    dispatch({ type:"BULK_DELETE_HOLDINGS", payload:[holding.symbol] });
+    toast(`${holding.symbol} and all its trades deleted`);
+  }
+
+  function doRename() {
+    if (!renameSymbol.trim()) return;
+    const newSym = renameSymbol.trim().toUpperCase();
+    dispatch({ type:"RENAME_STOCK", payload:{ oldSymbol:holding.symbol, newSymbol:newSym, newName:renameName||holding.name } });
+    toast(`Renamed ${holding.symbol} → ${newSym}`);
+    setShowRename(false);
+  }
+
+  return (
+    <div style={{borderBottom:"1px solid #F1F5F9"}}>
+      {/* Main row — clickable to expand, or checkbox in bulk mode */}
+      <div
+        onClick={bulkSelectMode ? onBulkSelect : ()=>{ onToggle(holding.id); }}
+        style={{display:"flex",alignItems:"center",gap:10,padding:"13px 14px",cursor:"pointer",background:isSelected?"#EEF2FF":isOpen?"#F8FAFC":"transparent"}}>
+        {bulkSelectMode && (
+          <div style={{width:20,height:20,borderRadius:5,border:`2px solid ${isSelected?"#6366F1":"#CBD5E1"}`,background:isSelected?"#6366F1":"#fff",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,color:"#fff"}}>
+            {isSelected&&"✓"}
+          </div>
+        )}
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}>
+            <span style={{fontWeight:800,color:"#6366F1",fontSize:14}}>{holding.symbol}</span>
+            <span style={{fontSize:11,color:"#94A3B8",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{holding.name}</span>
+          </div>
+          <div style={{fontSize:12,color:"#64748B"}}>
+            {fmtNum(qty)} {holding.type==="mf"?"units":"shares"} · Avg {fmtCur(avgPrice,cur)}
+            {broker&&<span style={{marginLeft:6}}>· {broker.name}</span>}
+          </div>
+        </div>
+        <div style={{textAlign:"right",flexShrink:0}}>
+          {livePrice ? (
+            <>
+              <div style={{fontWeight:700,fontSize:14}}>{fmtCur(currentVal,cur)}</div>
+              <div style={{fontSize:11,fontWeight:600,color:totalDiff>=0?"#10B981":"#EF4444"}}>
+                {totalDiff>=0?"▲":"▼"}{Math.abs(pctDiff).toFixed(1)}%
+              </div>
+            </>
+          ) : (
+            <>
+              <div style={{fontWeight:700,fontSize:14}}>{fmtCur(investedAmt,cur)}</div>
+              <div style={{fontSize:11,color:"#94A3B8"}}>invested</div>
+            </>
+          )}
+        </div>
+        <span style={{color:"#94A3B8",fontSize:12,flexShrink:0}}>{isOpen?"▲":"▼"}</span>
+      </div>
+
+      {/* Expanded section — P&L stats + View Trade History button */}
+      {isOpen&&(
+        <div style={{background:"#F8FAFC",borderTop:"1px solid #F1F5F9",padding:"12px 14px"}}>
+          {/* P&L panel */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:12}}>
+            {[
+              {label:"Invested",  val:fmtCur(investedAmt,cur), color:"#475569"},
+              {label:"Avg Price", val:fmtCur(avgPrice,cur),    color:"#475569"},
+              {label:"Qty/Units", val:fmtNum(qty),             color:"#475569"},
+            ].map(x=>(
+              <div key={x.label} style={{background:"#fff",borderRadius:8,padding:"8px 10px",textAlign:"center"}}>
+                <div style={{fontSize:12,fontWeight:700,color:x.color}}>{x.val}</div>
+                <div style={{fontSize:10,color:"#94A3B8",marginTop:2}}>{x.label}</div>
+              </div>
+            ))}
+          </div>
+          {livePrice&&(
+            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:12}}>
+              {[
+                {label:"Live Price", val:fmtCur(livePrice,cur),  color:"#0F172A"},
+                {label:"Curr Value", val:fmtCur(currentVal,cur), color:"#0F172A"},
+                {label:"Gain/Loss",  val:`${totalDiff>=0?"+":""}${fmtCur(totalDiff,cur)} (${pctDiff.toFixed(1)}%)`, color:totalDiff>=0?"#10B981":"#EF4444"},
+              ].map(x=>(
+                <div key={x.label} style={{background:"#fff",borderRadius:8,padding:"8px 10px",textAlign:"center"}}>
+                  <div style={{fontSize:12,fontWeight:700,color:x.color}}>{x.val}</div>
+                  <div style={{fontSize:10,color:"#94A3B8",marginTop:2}}>{x.label}</div>
+                </div>
+              ))}
+            </div>
+          )}
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+            <button onClick={e=>{e.stopPropagation();loadLivePrice();}} disabled={priceLoading}
+              style={{fontSize:12,padding:"7px 14px",borderRadius:8,border:"1.5px solid #C7D2FE",background:priceLoading?"#F1F5F9":"#EEF2FF",color:priceLoading?"#94A3B8":"#6366F1",cursor:priceLoading?"not-allowed":"pointer",fontFamily:"inherit",fontWeight:600,display:"flex",alignItems:"center",gap:5}}>
+              {priceLoading ? <><span style={{display:"inline-block",width:10,height:10,border:"2px solid #C7D2FE",borderTopColor:"#6366F1",borderRadius:"50%",animation:"spin 0.8s linear infinite"}}></span> Fetching…</> : "🔍 Fetch Live Price"}
+            </button>
+            <button onClick={e=>{e.stopPropagation();setShowPriceInput(p=>!p);}}
+              style={{fontSize:12,padding:"7px 14px",borderRadius:8,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+              ✏️ Set Manually
+            </button>
+            <button onClick={e=>{e.stopPropagation();setShowHistory(true);}}
+              style={{fontSize:12,padding:"7px 14px",borderRadius:8,border:"1.5px solid #C7D2FE",background:"#fff",color:"#6366F1",cursor:"pointer",fontFamily:"inherit",fontWeight:700}}>
+              📋 Trade History ({tradeCount})
+            </button>
+            <button onClick={e=>{e.stopPropagation();setShowRename(p=>!p);setRenameSymbol(holding.symbol);setRenameName(holding.name||"");}}
+              style={{fontSize:12,padding:"7px 14px",borderRadius:8,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+              ✏️ Rename
+            </button>
+            <button onClick={e=>{e.stopPropagation();deleteSingleHolding();}}
+              style={{fontSize:12,padding:"7px 14px",borderRadius:8,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:600,marginLeft:"auto"}}>
+              🗑️ Delete All Trades
+            </button>
+          </div>
+          {showPriceInput&&(
+            <div style={{marginTop:10,background:"#F0FDF4",borderRadius:10,padding:"10px 12px",border:"1.5px solid #A7F3D0"}} onClick={e=>e.stopPropagation()}>
+              <div style={{fontSize:12,fontWeight:600,color:"#065F46",marginBottom:8}}>📌 Set Current Price for {holding.symbol}</div>
+              <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                <input value={manualPriceVal} onChange={e=>setManualPriceVal(e.target.value)}
+                  placeholder="e.g. 382.50" type="number" min="0" step="0.01"
+                  style={{...inputStyle,padding:"7px 10px",fontSize:13,flex:1}}
+                  onFocus={e=>e.target.style.borderColor="#10B981"}
+                  onBlur={e=>e.target.style.borderColor="#E2E8F0"}
+                  onClick={e=>e.stopPropagation()} />
+                <button onClick={e=>{e.stopPropagation();saveManualPrice();}}
+                  style={{padding:"7px 14px",borderRadius:8,border:"none",background:"#10B981",color:"#fff",cursor:"pointer",fontWeight:700,fontSize:12,fontFamily:"inherit",flexShrink:0}}>✓ Save</button>
+                <button onClick={e=>{e.stopPropagation();setShowPriceInput(false);setManualPriceVal("");}}
+                  style={{padding:"7px 10px",borderRadius:8,border:"1.5px solid #E2E8F0",background:"#fff",color:"#64748B",cursor:"pointer",fontSize:12,fontFamily:"inherit",flexShrink:0}}>✕</button>
+              </div>
+            </div>
+          )}
+          {showRename&&(
+            <div style={{marginTop:10,background:"#F8FAFC",borderRadius:10,padding:"10px 12px"}}>
+              <div style={{fontSize:12,fontWeight:600,color:"#64748B",marginBottom:8}}>Rename Symbol</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
+                <input value={renameSymbol} onChange={e=>setRenameSymbol(e.target.value.toUpperCase())}
+                  placeholder="New Symbol"
+                  style={{...inputStyle,padding:"8px 10px",fontSize:13}}
+                  onClick={e=>e.stopPropagation()} />
+                <input value={renameName} onChange={e=>setRenameName(e.target.value)}
+                  placeholder="New Name (optional)"
+                  style={{...inputStyle,padding:"8px 10px",fontSize:13}}
+                  onClick={e=>e.stopPropagation()} />
+              </div>
+              <div style={{display:"flex",gap:8}}>
+                <button onClick={e=>{e.stopPropagation();doRename();}}
+                  style={{padding:"6px 14px",borderRadius:8,border:"none",background:"#6366F1",color:"#fff",cursor:"pointer",fontWeight:700,fontSize:12,fontFamily:"inherit"}}>✓ Save</button>
+                <button onClick={e=>{e.stopPropagation();setShowRename(false);}}
+                  style={{padding:"6px 14px",borderRadius:8,border:"1.5px solid #E2E8F0",background:"#fff",color:"#64748B",cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>Cancel</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {showHistory&&(
+        <TradeHistoryModal
+          symbol={holding.symbol}
+          holding={holding}
+          investmentTx={investmentTx}
+          accounts={accounts}
+          state={state}
+          dispatch={dispatch}
+          onClose={()=>setShowHistory(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── FD CARD ──────────────────────────────────────────────────────────────────
+function FDCard({ fd, accounts, dispatch, state }) {
+  const r = calcFDReturns(fd);
+  const broker = accounts.find(a=>a.id===fd.accountId);
+  const [editing,   setEditing]   = useState(false);
+  const [showClose, setShowClose] = useState(false);
+  const [closeDate, setCloseDate] = useState(new Date().toISOString().slice(0,10));
+  const [closeAccId, setCloseAccId] = useState(fd.sourceAccountId||"");
+  const [overrideInterest, setOverrideInterest] = useState("");
+  const today = new Date();
+  const matDate = new Date(fd.maturityDate+"T00:00:00");
+  const isMatured = matDate <= today;
+  const daysLeft = Math.max(0, Math.ceil((matDate-today)/(1000*60*60*24)));
+  const nonInvAccounts = accounts.filter(a => !a.disabled && !a.isInvestmentType);
+
+  function closeFD() {
+    const interest = parseFloat(overrideInterest) || r.interest;
+    if (!window.confirm(`Close FD?
+• Principal ₹${r.principal.toLocaleString()} → source account
+• Interest ₹${interest.toLocaleString()} → income transaction`)) return;
+    dispatch({ type:"CLOSE_FD", payload:{ fdId:fd.id, incomeAccId:closeAccId, interestAmt:interest, closeDate } });
+    toast("FD closed. Principal returned + interest logged as income.");
+    setShowClose(false);
+  }
+
+  return (
+    <Card style={{padding:"12px 14px",borderLeft:"4px solid #0EA5E9",marginBottom:10}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+        <div>
+          <div style={{fontWeight:700,fontSize:14,color:"#0F172A"}}>{fd.name||"Fixed Deposit"}</div>
+          <div style={{fontSize:11,color:"#94A3B8",marginTop:2}}>{broker?.name||""} · {fd.interestRate}% p.a.</div>
+        </div>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontWeight:800,fontSize:15,color:"#0EA5E9"}}>{fmtCur(r.principal,fd.currency||"INR")}</div>
+          <div style={{fontSize:10,color:"#94A3B8"}}>Invested amt</div>
+          <div style={{fontSize:10,color:"#10B981",fontWeight:600,marginTop:2}}>+{fmtCur(r.interest,fd.currency||"INR")} at maturity</div>
+        </div>
+      </div>
+      <div style={{display:"flex",gap:12,fontSize:11,color:"#64748B",marginBottom:8}}>
+        <span>{fmtDate(fd.investedDate)} → {fmtDate(fd.maturityDate)}</span>
+      </div>
+      {isMatured&&!showClose&&(
+        <div style={{background:"#F0FDF4",border:"1.5px solid #A7F3D0",borderRadius:8,padding:"7px 10px",marginBottom:8,fontSize:12,color:"#065F46",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <span>✅ Matured! Close to return principal + log interest.</span>
+          <button onClick={()=>setShowClose(true)} style={{fontSize:11,padding:"4px 10px",borderRadius:7,border:"none",background:"#10B981",color:"#fff",cursor:"pointer",fontWeight:700,fontFamily:"inherit",flexShrink:0,marginLeft:8}}>Close FD</button>
+        </div>
+      )}
+      {showClose&&(
+        <div style={{background:"#F0FDF4",border:"1.5px solid #A7F3D0",borderRadius:10,padding:"12px",marginBottom:10}}>
+          <div style={{fontSize:13,fontWeight:700,color:"#065F46",marginBottom:10}}>🏦 Close Fixed Deposit</div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
+            <div>
+              <div style={{fontSize:11,color:"#64748B",marginBottom:4}}>Close Date</div>
+              <input type="date" value={closeDate} onChange={e=>setCloseDate(e.target.value)}
+                style={{...inputStyle,padding:"7px 10px",fontSize:13}} />
+            </div>
+            <div>
+              <div style={{fontSize:11,color:"#64748B",marginBottom:4}}>Interest Amount (₹)</div>
+              <input type="number" value={overrideInterest} onChange={e=>setOverrideInterest(e.target.value)}
+                placeholder={String(r.interest.toFixed(2))}
+                style={{...inputStyle,padding:"7px 10px",fontSize:13}} />
+            </div>
+          </div>
+          <div style={{marginBottom:8}}>
+            <div style={{fontSize:11,color:"#64748B",marginBottom:4}}>Credit interest & principal to</div>
+            <select value={closeAccId} onChange={e=>setCloseAccId(e.target.value)} style={{...inputStyle,padding:"7px 10px",fontSize:13,background:"#fff"}}>
+              <option value="">— Select account —</option>
+              {nonInvAccounts.map(a=><option key={a.id} value={a.id}>{a.icon||""} {a.name}</option>)}
+            </select>
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={closeFD} style={{flex:1,padding:"8px",borderRadius:8,border:"none",background:"#10B981",color:"#fff",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>✓ Confirm Close</button>
+            <button onClick={()=>setShowClose(false)} style={{padding:"8px 14px",borderRadius:8,border:"1.5px solid #E2E8F0",background:"#fff",color:"#64748B",cursor:"pointer",fontSize:13,fontFamily:"inherit"}}>Cancel</button>
+          </div>
+        </div>
+      )}
+      <div style={{display:"flex",gap:5,alignItems:"center",flexWrap:"wrap"}}>
+        {!isMatured&&<span style={{fontSize:10,background:"#EFF6FF",color:"#3B82F6",padding:"2px 7px",borderRadius:8,fontWeight:600}}>{daysLeft}d left</span>}
+        {isMatured&&!showClose&&<span style={{fontSize:10,background:"#F0FDF4",color:"#10B981",padding:"2px 7px",borderRadius:8,fontWeight:600}}>Matured</span>}
+        <button onClick={()=>setEditing(true)} style={{fontSize:11,padding:"3px 8px",borderRadius:6,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>✏️ Edit</button>
+        <button onClick={()=>{if(window.confirm("Delete this FD?"))dispatch({type:"DELETE_FD",payload:fd.id});}} style={{fontSize:11,padding:"3px 8px",borderRadius:6,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>🗑️</button>
+        {!showClose&&<button onClick={()=>setShowClose(true)} style={{fontSize:11,padding:"3px 8px",borderRadius:6,border:"1.5px solid #A7F3D0",background:"#F0FDF4",color:"#065F46",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>🔒 Close FD</button>}
+      </div>
+      {editing&&(
+        <InvestModal state={state||{accounts,accountCategories:DEFAULT.accountCategories}} editTx={{...fd,invType:"fd",fdAmount:fd.amount,fdRate:fd.interestRate,fdInvDate:fd.investedDate,fdMatDate:fd.maturityDate}} onClose={()=>setEditing(false)}
+          onSave={({fd:updated})=>{dispatch({type:"EDIT_FD",payload:{...fd,...updated}});setEditing(false);toast("FD updated");}} />
+      )}
+    </Card>
+  );
+}
+
+// ─── IMPORT MODAL ─────────────────────────────────────────────────────────────
+// Supports CSV + XLSX import for trades, expenses, income.
+// Validates columns; shows errors; dispatches bulk on confirm.
+function ImportModal({ state, dispatch, onClose }) {
+  const [importType, setImportType] = useState("expense");
+  const [rows,       setRows]       = useState([]);
+  const [errors,     setErrors]     = useState([]);
+  const [fileName,   setFileName]   = useState("");
+  const [loading,    setLoading]    = useState(false);
+  const fileRef = useRef(null);
+
+  const TEMPLATES = {
+    expense: { cols:["Date","Amount","Category","Account","Note"], sample:[["2024-01-15","1500","Food & Dining","SBI Savings","Lunch"],["2024-01-16","500","Transport","SBI Savings","Auto"]] },
+    income:  { cols:["Date","Amount","Category","Account","Note"], sample:[["2024-01-01","50000","Salary","SBI Savings","Jan salary"]] },
+    trade:   { cols:["Date","Symbol","Type","Quantity","Price","InvestmentAccount","SourceAccount","Note"], sample:[["2024-01-10","TCS","buy","10","3500","Zerodha","SBI Savings","Q4 buy"]] },
+  };
+
+  function downloadTemplate(type) {
+    const t = TEMPLATES[type];
+    const csv = [t.cols.join(","), ...t.sample.map(r=>r.join(","))].join("\n");
+    const blob = new Blob([csv], {type:"text/csv"});
+    const a = document.createElement("a"); a.href=URL.createObjectURL(blob);
+    a.download=`wealthmap_${type}_template.csv`; a.click();
+    toast("Template downloaded");
+  }
+
+  async function handleFile(file) {
+    if (!file) return;
+    setFileName(file.name); setLoading(true); setRows([]); setErrors([]);
+    try {
+      let csvText = "";
+      if (file.name.endsWith(".csv") || file.name.endsWith(".txt")) {
+        csvText = await file.text();
+      } else if (file.name.endsWith(".xlsx") || file.name.endsWith(".xls")) {
+        // Use SheetJS via CDN fallback
+        const buf = await file.arrayBuffer();
+        const XLSX = window.XLSX;
+        if (!XLSX) { setErrors(["XLSX support requires SheetJS. Please use CSV format."]); setLoading(false); return; }
+        const wb = XLSX.read(buf);
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        csvText = XLSX.utils.sheet_to_csv(ws);
+      } else {
+        setErrors(["Unsupported file type. Use .csv, .xlsx, or .xls"]);
+        setLoading(false); return;
+      }
+      parseCSV(csvText);
+    } catch(e) {
+      setErrors(["Failed to read file: " + e.message]);
+    }
+    setLoading(false);
+  }
+
+  function parseCSV(text) {
+    const lines = text.trim().split(/\r?\n/).filter(Boolean);
+    if (lines.length < 2) { setErrors(["File is empty or has only headers"]); return; }
+    const headers = lines[0].split(",").map(h=>h.trim().replace(/^["']|["']$/g,""));
+    const expected = TEMPLATES[importType].cols;
+    const missing = expected.filter(col => !headers.some(h=>h.toLowerCase()===col.toLowerCase()));
+    if (missing.length>0) { setErrors([`Missing columns: ${missing.join(", ")}`]); return; }
+
+    const errs=[]; const parsed=[];
+    lines.slice(1).forEach((line,i) => {
+      const vals = line.split(",").map(v=>v.trim().replace(/^["']|["']$/g,""));
+      const row = {};
+      headers.forEach((h,j) => row[h.toLowerCase()] = vals[j]||"");
+      // Validate
+      if (!row.date||isNaN(Date.parse(row.date))) errs.push(`Row ${i+2}: invalid date "${row.date}"`);
+      if (importType!=="trade") {
+        if (!row.amount||isNaN(parseFloat(row.amount))) errs.push(`Row ${i+2}: invalid amount "${row.amount}"`);
+      } else {
+        if (!row.quantity||isNaN(parseFloat(row.quantity))) errs.push(`Row ${i+2}: invalid quantity`);
+        if (!row.price||isNaN(parseFloat(row.price))) errs.push(`Row ${i+2}: invalid price`);
+        if (!["buy","sell"].includes((row.type||"").toLowerCase())) errs.push(`Row ${i+2}: type must be buy or sell`);
+      }
+      parsed.push(row);
+    });
+    setErrors(errs);
+    setRows(parsed);
+  }
+
+  function doImport() {
+    const accounts = state?.accounts||[];
+    const expCats  = state?.expenseCategories||DEFAULT.expenseCategories;
+    const incCats  = state?.incomeCategories ||DEFAULT.incomeCategories;
+    const accTypes = state?.accountCategories||DEFAULT.accountCategories;
+    const investType = accTypes.find(t=>t.isInvestmentType);
+    let count=0, skipped=0;
+
+    // ── Dedup helpers ──────────────────────────────────────────────────────
+    // Build fingerprints of existing records to skip exact duplicates
+    const existingTxFingerprints = new Set(
+      (state?.transactions||[]).map(t =>
+        `${t.type}|${t.date}|${t.amount}|${t.accountId}|${t.categoryId}`
+      )
+    );
+    const existingTradeFingerprints = new Set(
+      (state?.investmentTx||[]).map(t =>
+        `${t.type}|${t.date}|${t.symbol}|${t.quantity}|${t.price}|${t.accountId}`
+      )
+    );
+
+    rows.forEach(row => {
+      if (importType==="expense"||importType==="income") {
+        const cats   = importType==="expense" ? expCats : incCats;
+        const catObj = cats.find(c=>c.name.toLowerCase()===row.category?.toLowerCase());
+        const acc    = accounts.find(a=>a.name.toLowerCase()===row.account?.toLowerCase());
+        const fp = `${importType}|${row.date}|${parseFloat(row.amount)||0}|${acc?.id||""}|${catObj?.id||""}`;
+        if (existingTxFingerprints.has(fp)) { skipped++; return; }
+        const tx = {
+          id: uid(), type: importType,
+          amount: parseFloat(row.amount)||0,
+          currency: acc?.currency||"INR",
+          categoryId: catObj?.id||cats[0]?.id||"",
+          accountId:  acc?.id||accounts[0]?.id||"",
+          note: row.note||"",
+          date: row.date,
+          tags: [],
+          isRefunded: false, refundedAmount: 0,
+        };
+        dispatch({type:"ADD_TX",payload:tx});
+        existingTxFingerprints.add(fp); // prevent intra-batch dupes too
+        count++;
+      } else if (importType==="trade") {
+        const invAcc = accounts.find(a=>a.name.toLowerCase()===(row.investmentaccount||"").toLowerCase());
+        const srcAcc = accounts.find(a=>a.name.toLowerCase()===(row.sourceaccount||"").toLowerCase());
+        const sym    = (row.symbol||"").toUpperCase();
+        const tradeType = row.type?.toLowerCase()||"buy";
+        const qty    = parseFloat(row.quantity)||0;
+        const price  = parseFloat(row.price)||0;
+        const fp = `${tradeType}|${row.date}|${sym}|${qty}|${price}|${invAcc?.id||""}`;
+        if (existingTradeFingerprints.has(fp)) { skipped++; return; }
+        const holdingId = uid();
+        const itx = {
+          id:uid(), holdingId, type: tradeType,
+          invType:"stock", symbol:sym, name:sym,
+          quantity: qty, price, currency: invAcc?.currency||"INR",
+          date: row.date,
+          accountId: invAcc?.id||accounts[0]?.id||"",
+          sourceAccountId: srcAcc?.id||"",
+          brokerage:0, note: row.note||"",
+        };
+        const newHolding = tradeType==="buy" ? {
+          id:holdingId,symbol:sym,name:sym,type:"stock",
+          accountId:itx.accountId,currency:itx.currency,
+          lots:[],quantity:0,units:0,avgPrice:0,investedAmount:0,
+        } : null;
+        dispatch({type:"ADD_INVESTMENT",payload:{itx,newHolding,isFD:false}});
+        existingTradeFingerprints.add(fp); // prevent intra-batch dupes too
+        count++;
+      }
+    });
+    const msg = skipped > 0
+      ? `${count} imported, ${skipped} duplicate(s) skipped`
+      : `${count} record(s) imported successfully`;
+    toast(msg);
+    onClose();
+  }
+
+  return (
+    <Modal title="Import Data" onClose={onClose}>
+      {/* Type selector */}
+      <div style={{display:"flex",gap:6,marginBottom:16,overflowX:"auto",paddingBottom:2}}>
+        {[["expense","📤 Expenses"],["income","📥 Income"],["trade","📊 Trades"]].map(([v,l])=>(
+          <button key={v} onClick={()=>{setImportType(v);setRows([]);setErrors([]);setFileName("");}}
+            style={{flexShrink:0,padding:"7px 14px",borderRadius:18,border:`2px solid ${importType===v?"#6366F1":"#E2E8F0"}`,background:importType===v?"#EEF2FF":"#fff",color:importType===v?"#6366F1":"#64748B",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>{l}</button>
+        ))}
+      </div>
+
+      {/* Download template */}
+      <div style={{background:"#EEF2FF",border:"1.5px solid #C7D2FE",borderRadius:10,padding:12,marginBottom:16,fontSize:13}}>
+        <div style={{fontWeight:600,color:"#4338CA",marginBottom:6}}>📋 Required columns:</div>
+        <div style={{color:"#475569",fontFamily:"monospace",fontSize:12,marginBottom:8}}>
+          {TEMPLATES[importType].cols.join(" | ")}
+        </div>
+        <button onClick={()=>downloadTemplate(importType)}
+          style={{fontSize:12,padding:"5px 12px",borderRadius:8,border:"1.5px solid #C7D2FE",background:"#fff",color:"#6366F1",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+          ⬇️ Download Template
+        </button>
+      </div>
+
+      {/* File upload */}
+      <input ref={fileRef} type="file" accept=".csv,.xlsx,.xls" style={{display:"none"}}
+        onChange={e=>handleFile(e.target.files[0])} />
+      <button onClick={()=>fileRef.current?.click()}
+        style={{width:"100%",padding:"12px",borderRadius:10,border:"2px dashed #C7D2FE",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600,fontSize:14,marginBottom:12}}>
+        {loading?"⏳ Reading…":fileName?`📄 ${fileName}`:"📂 Click to Upload CSV / XLSX"}
+      </button>
+
+      {/* Errors */}
+      {errors.length>0&&(
+        <div style={{background:"#FEF2F2",border:"1.5px solid #FECACA",borderRadius:10,padding:12,marginBottom:12}}>
+          <div style={{fontWeight:600,color:"#EF4444",marginBottom:6}}>⚠️ Validation Errors</div>
+          {errors.map((e,i)=><div key={i} style={{fontSize:12,color:"#991B1B",padding:"2px 0"}}>• {e}</div>)}
+        </div>
+      )}
+
+      {/* Preview */}
+      {rows.length>0&&errors.length===0&&(()=>{
+        // Calculate duplicates ahead of time for preview
+        const existingTxFP = new Set((state?.transactions||[]).map(t=>`${t.type}|${t.date}|${t.amount}|${t.accountId}|${t.categoryId}`));
+        const existingTradeFP = new Set((state?.investmentTx||[]).map(t=>`${t.type}|${t.date}|${(t.symbol||"").toUpperCase()}|${t.quantity}|${t.price}|${t.accountId}`));
+        const accounts = state?.accounts||[];
+        const expCats = state?.expenseCategories||DEFAULT.expenseCategories;
+        const incCats = state?.incomeCategories||DEFAULT.incomeCategories;
+        let dupCount = 0;
+        rows.forEach(row => {
+          if (importType==="expense"||importType==="income") {
+            const cats = importType==="expense"?expCats:incCats;
+            const catObj = cats.find(c=>c.name.toLowerCase()===row.category?.toLowerCase());
+            const acc = accounts.find(a=>a.name.toLowerCase()===row.account?.toLowerCase());
+            const fp = `${importType}|${row.date}|${parseFloat(row.amount)||0}|${acc?.id||""}|${catObj?.id||""}`;
+            if (existingTxFP.has(fp)) dupCount++;
+          } else if (importType==="trade") {
+            const invAcc = accounts.find(a=>a.name.toLowerCase()===(row.investmentaccount||"").toLowerCase());
+            const sym = (row.symbol||"").toUpperCase();
+            const fp = `${row.type?.toLowerCase()||"buy"}|${row.date}|${sym}|${parseFloat(row.quantity)||0}|${parseFloat(row.price)||0}|${invAcc?.id||""}`;
+            if (existingTradeFP.has(fp)) dupCount++;
+          }
+        });
+        const newCount = rows.length - dupCount;
+        return (
+          <div style={{marginBottom:12}}>
+            <div style={{display:"flex",gap:8,marginBottom:8,flexWrap:"wrap"}}>
+              <div style={{fontWeight:600,fontSize:13,color:"#10B981"}}>✅ {newCount} new record(s) to import</div>
+              {dupCount>0&&<div style={{fontWeight:600,fontSize:13,color:"#F59E0B"}}>⚠️ {dupCount} duplicate(s) will be skipped</div>}
+            </div>
+            <div style={{maxHeight:160,overflowY:"auto",fontSize:12,background:"#F8FAFC",borderRadius:8,padding:8}}>
+              {rows.slice(0,5).map((r,i)=>(
+                <div key={i} style={{color:"#475569",padding:"2px 0",fontFamily:"monospace"}}>{Object.values(r).join(" | ")}</div>
+              ))}
+              {rows.length>5&&<div style={{color:"#94A3B8"}}>…and {rows.length-5} more</div>}
+            </div>
+          </div>
+        );
+      })()}
+
+      <BtnRow>
+        <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+        <Btn onClick={doImport} disabled={rows.length===0||errors.length>0}>
+          Import {rows.length>0?`${rows.length} Records`:""}
+        </Btn>
+      </BtnRow>
+    </Modal>
+  );
+}
+
+// ─── CORPORATE ACTION MODAL ──────────────────────────────────────────────────
+// Supported: stock_split, reverse_split, bonus, dividend, stock_name_change,
+//            merger, demerger. All actions have delete option.
+function CorporateActionModal({ state, dispatch, onClose }) {
+  const holdings   = state?.holdings   ||[];
+  const accounts   = state?.accounts   ||[];
+  const stocks     = state?.stocks     ||[];
+  const incCats    = state?.incomeCategories||DEFAULT.incomeCategories;
+  const corpActions= state?.corporateActions||[];
+
+  const symbols    = [...new Set(holdings.map(h=>h.symbol))];
+  const allSymbols = [...new Set([...symbols, ...stocks.map(s=>s.symbol)])];
+
+  const [tab,        setTab]       = useState("add");
+  const [actionType, setActionType]= useState("stock_split");
+  const [symbol,     setSymbol]    = useState(symbols[0]||"");
+  const [ratio,      setRatio]     = useState("");
+  const [date,       setDate]      = useState(new Date().toISOString().slice(0,10));
+  const [note,       setNote]      = useState("");
+  const [divAmount,  setDivAmount] = useState("");
+  const [divAccId,   setDivAccId]  = useState(accounts[0]?.id||"");
+  const [newSymbol,  setNewSymbol] = useState("");
+  const [newName,    setNewName]   = useState("");
+  // Merger fields
+  const [toSymbol,   setToSymbol]  = useState("");
+  const [toName,     setToName]    = useState("");
+  // Demerger fields
+  const [demergerResults, setDemergerResults] = useState([{symbol:"",name:"",ratio:"1"}]);
+
+  const ACTION_TYPES = [
+    { value:"stock_split",       label:"📈 Stock Split",         desc:"1→2: qty doubles, price halves" },
+    { value:"reverse_split",     label:"📉 Reverse Split/Merge", desc:"2→1: qty halves, price doubles" },
+    { value:"bonus",             label:"🎁 Bonus Issue",          desc:"Extra shares, invested value unchanged" },
+    { value:"dividend",          label:"💰 Dividend",             desc:"Cash payout credited to account" },
+    { value:"stock_name_change", label:"✏️ Name/Symbol Change",  desc:"Rename symbol, keep trade history" },
+    { value:"merger",            label:"🔀 Merger",               desc:"Stock A merges into B" },
+    { value:"demerger",          label:"🪢 Demerger",             desc:"Stock splits into multiple stocks" },
+  ];
+
+  const bankAccs = accounts.filter(a=>!a.isCreditCard&&!(a.is_active===false)&&!a.disabled);
+
+  function addDemergerResult()   { setDemergerResults(r=>[...r,{symbol:"",name:"",ratio:"1"}]); }
+  function delDemergerResult(i)  { setDemergerResults(r=>r.filter((_,j)=>j!==i)); }
+  function updDemergerResult(i,k,v) { setDemergerResults(r=>r.map((x,j)=>j===i?{...x,[k]:v}:x)); }
+
+  function save() {
+    if (!symbol) { alert("Select a symbol"); return; }
+    if (!date)   { alert("Enter a date"); return; }
+
+    if (actionType==="stock_name_change") {
+      if (!newSymbol) { alert("Enter new symbol"); return; }
+      const ca = {id:uid(),symbol,action_type:"stock_name_change",new_symbol:newSymbol.toUpperCase(),new_name:newName||newSymbol.toUpperCase(),old_name:holdings.find(h=>h.symbol===symbol)?.name||symbol,date,note};
+      dispatch({type:"ADD_CORPORATE_ACTION",payload:ca});
+      toast(`Symbol changed: ${symbol} → ${newSymbol.toUpperCase()}`);
+      onClose(); return;
+    }
+
+    if (actionType==="dividend") {
+      if (!divAmount||parseFloat(divAmount)<=0) { alert("Enter dividend amount"); return; }
+      if (!divAccId) { alert("Select account"); return; }
+      const holding = holdings.find(h=>h.symbol===symbol);
+      const divTx = {
+        id:uid(), type:"income", date,
+        amount:parseFloat(divAmount), currency:holding?.currency||"INR",
+        accountId:divAccId, categoryId:incCats.find(c=>c.id==="ic_div")?.id||incCats[0]?.id,
+        note:`Dividend: ${symbol}${note?` · ${note}`:""}`,
+      };
+      dispatch({type:"ADD_TX",payload:divTx});
+      const ca = {id:uid(),symbol,action_type:"dividend",amount:parseFloat(divAmount),date,note};
+      dispatch({type:"ADD_CORPORATE_ACTION",payload:ca});
+      toast(`Dividend ₹${divAmount} credited as income`);
+      onClose(); return;
+    }
+
+    if (actionType==="merger") {
+      if (!toSymbol) { alert("Enter target symbol (stock merging into)"); return; }
+      const targetSym = toSymbol.toUpperCase();
+      // Auto-create target stock in master if not exists
+      if (!stocks.find(s=>s.symbol===targetSym)) {
+        dispatch({type:"ADD_STOCK",payload:{id:uid(),symbol:targetSym,name:toName||targetSym,type:"stock",exchange:""}});
+      }
+      // Get current holding qty
+      const sourceHolding = holdings.find(h=>h.symbol===symbol);
+      const sourceQty = sourceHolding?.quantity||sourceHolding?.units||0;
+      // Add merger corporate action
+      const ca = {id:uid(),symbol,action_type:"merger",to_symbol:targetSym,to_name:toName||targetSym,ratio:parseFloat(ratio)||1,date,note};
+      dispatch({type:"ADD_CORPORATE_ACTION",payload:ca});
+      toast(`Merger: ${symbol} → ${targetSym} applied`);
+      onClose(); return;
+    }
+
+    if (actionType==="demerger") {
+      const valid = demergerResults.filter(r=>r.symbol.trim());
+      if (valid.length===0) { alert("Add at least one resulting stock"); return; }
+      const r = parseFloat(ratio)||1;
+      // Auto-add new stocks to master
+      valid.forEach(res=>{
+        const sym = res.symbol.toUpperCase();
+        if (!stocks.find(s=>s.symbol===sym)) {
+          dispatch({type:"ADD_STOCK",payload:{id:uid(),symbol:sym,name:res.name||sym,type:"stock",exchange:""}});
+        }
+      });
+      const ca = {id:uid(),symbol,action_type:"demerger",ratio:r,result_symbols:valid.map(r=>r.toUpperCase?r.toUpperCase():r.symbol.toUpperCase()),result_stocks:valid.map(r=>({symbol:r.symbol.toUpperCase(),name:r.name||r.symbol,ratio:parseFloat(r.ratio)||1})),date,note};
+      dispatch({type:"ADD_CORPORATE_ACTION",payload:ca});
+      toast(`Demerger applied: ${symbol} → ${valid.map(r=>r.symbol.toUpperCase()).join(", ")}`);
+      onClose(); return;
+    }
+
+    // stock_split / reverse_split / bonus
+    const r = parseFloat(ratio);
+    if (!r||r<=0) { alert("Enter a valid ratio"); return; }
+    const ca = {id:uid(),symbol,action_type:actionType,ratio:r,date,note};
+    dispatch({type:"ADD_CORPORATE_ACTION",payload:ca});
+    const labels = {stock_split:`Split: ${symbol} ×${r}`,reverse_split:`Reverse split: ${symbol} ÷${r}`,bonus:`Bonus: ${symbol} ×${r}`};
+    toast(labels[actionType]||"Applied");
+    onClose();
+  }
+
+  function deleteAction(ca) {
+    if (!window.confirm(`Delete this ${ca.action_type} action? Holdings will be reversed.`)) return;
+    dispatch({type:"DELETE_CORPORATE_ACTION",payload:ca.id});
+    toast("Corporate action deleted — holdings reversed");
+  }
+
+  return (
+    <Modal title="Corporate Action" onClose={onClose}>
+      {/* Tab: Add / History */}
+      <div style={{display:"flex",gap:6,marginBottom:16}}>
+        {[["add","➕ Add Action"],["history","📋 History"]].map(([k,l])=>(
+          <button key={k} onClick={()=>setTab(k)}
+            style={{flex:1,padding:"8px",borderRadius:10,border:`2px solid ${tab===k?"#6366F1":"#E2E8F0"}`,background:tab===k?"#EEF2FF":"#fff",color:tab===k?"#6366F1":"#64748B",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>{l}</button>
+        ))}
+      </div>
+
+      {tab==="history" && (
+        <div>
+          {corpActions.length===0 ? (
+            <div style={{textAlign:"center",padding:32,color:"#94A3B8"}}>
+              <div style={{fontSize:36}}>📋</div>
+              <div style={{marginTop:8}}>No corporate actions yet</div>
+            </div>
+          ) : [...corpActions].reverse().map(ca=>(
+            <div key={ca.id} style={{display:"flex",alignItems:"flex-start",gap:10,padding:"12px 0",borderBottom:"1px solid #F1F5F9"}}>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontWeight:700,fontSize:13,color:"#0F172A"}}>{ca.symbol} · {ca.action_type.replace(/_/g," ")}</div>
+                <div style={{fontSize:11,color:"#64748B",marginTop:2}}>{fmtDate(ca.date)}{ca.ratio?` · ×${ca.ratio}`:""}{ca.new_symbol?` → ${ca.new_symbol}`:""}{ca.to_symbol?` → ${ca.to_symbol}`:""}{ca.note?` · ${ca.note}`:""}</div>
+              </div>
+              <button onClick={()=>deleteAction(ca)}
+                style={{fontSize:11,padding:"4px 10px",borderRadius:7,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:600,flexShrink:0}}>🗑️ Delete</button>
+            </div>
+          ))}
+          <Btn variant="ghost" onClick={onClose} style={{width:"100%",marginTop:16}}>Close</Btn>
+        </div>
+      )}
+
+      {tab==="add" && (
+        <>
+          <Field label="Action Type">
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              {ACTION_TYPES.map(at=>(
+                <button key={at.value} onClick={()=>setActionType(at.value)}
+                  style={{padding:"9px 14px",borderRadius:10,border:`2px solid ${actionType===at.value?"#6366F1":"#E2E8F0"}`,background:actionType===at.value?"#EEF2FF":"#fff",color:actionType===at.value?"#6366F1":"#475569",fontWeight:600,fontSize:13,cursor:"pointer",fontFamily:"inherit",textAlign:"left"}}>
+                  <div>{at.label}</div>
+                  <div style={{fontSize:11,color:"#94A3B8",marginTop:1,fontWeight:400}}>{at.desc}</div>
+                </button>
+              ))}
+            </div>
+          </Field>
+
+          {allSymbols.length>0
+            ? <Sel label="Stock Symbol" value={symbol} onChange={e=>setSymbol(e.target.value)}>
+                {allSymbols.map(s=><option key={s} value={s}>{s}</option>)}
+              </Sel>
+            : <Inp label="Stock Symbol" value={symbol} onChange={e=>setSymbol(e.target.value.toUpperCase())} placeholder="e.g. RELIANCE" />
+          }
+
+          <Inp label="Action Date" type="date" value={date} onChange={e=>setDate(e.target.value)} />
+
+          {(actionType==="stock_split"||actionType==="reverse_split"||actionType==="bonus")&&(
+            <Inp label={
+              actionType==="stock_split"?"Split Ratio (e.g. 2 for 1→2)":
+              actionType==="reverse_split"?"Merge Ratio (e.g. 10 for 10→1)":
+              "Bonus Ratio (e.g. 0.2 for 1 bonus per 5)"
+            } type="number" inputMode="decimal" value={ratio} onChange={e=>setRatio(e.target.value)}
+              placeholder={actionType==="bonus"?"e.g. 0.2":"e.g. 2"} />
+          )}
+
+          {actionType==="dividend"&&(
+            <>
+              <Inp label="Total Dividend Amount (₹)" type="number" inputMode="decimal" value={divAmount} onChange={e=>setDivAmount(e.target.value)} placeholder="e.g. 5000" />
+              <Sel label="Credit to Account" value={divAccId} onChange={e=>setDivAccId(e.target.value)}>
+                <option value="">Select account…</option>
+                {bankAccs.map(a=><option key={a.id} value={a.id}>{a.icon} {a.name}</option>)}
+              </Sel>
+            </>
+          )}
+
+          {actionType==="stock_name_change"&&(
+            <>
+              <Inp label="New Symbol" value={newSymbol} onChange={e=>setNewSymbol(e.target.value.toUpperCase())} placeholder="e.g. NEWTCS" />
+              <Inp label="New Name (optional)" value={newName} onChange={e=>setNewName(e.target.value)} placeholder="e.g. New Company Name" />
+            </>
+          )}
+
+          {actionType==="merger"&&(
+            <>
+              <Inp label="Merging Into Symbol (Target)" value={toSymbol} onChange={e=>setToSymbol(e.target.value.toUpperCase())} placeholder="e.g. HDFC" note="If not in Stocks Master, it will be auto-created" />
+              <Inp label="Target Stock Name" value={toName} onChange={e=>setToName(e.target.value)} placeholder="e.g. HDFC Bank" />
+              <Inp label="Exchange Ratio (optional)" type="number" value={ratio} onChange={e=>setRatio(e.target.value)} placeholder="e.g. 1 (1:1 swap)" />
+            </>
+          )}
+
+          {actionType==="demerger"&&(
+            <>
+              <Field label="Resulting Stocks">
+                {demergerResults.map((r,i)=>(
+                  <div key={i} style={{display:"grid",gridTemplateColumns:"1fr 1fr 60px 28px",gap:6,marginBottom:6,alignItems:"end"}}>
+                    <Inp label={i===0?"Symbol":""} value={r.symbol} onChange={e=>updDemergerResult(i,"symbol",e.target.value.toUpperCase())} placeholder="Symbol" style={{marginBottom:0}} />
+                    <Inp label={i===0?"Name":""} value={r.name} onChange={e=>updDemergerResult(i,"name",e.target.value)} placeholder="Name" style={{marginBottom:0}} />
+                    <Inp label={i===0?"Ratio":""} type="number" value={r.ratio} onChange={e=>updDemergerResult(i,"ratio",e.target.value)} placeholder="1" style={{marginBottom:0}} />
+                    <button onClick={()=>delDemergerResult(i)} style={{width:28,height:42,borderRadius:7,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>×</button>
+                  </div>
+                ))}
+                <Btn variant="ghost" size="sm" onClick={addDemergerResult} style={{width:"100%",marginTop:4}}>+ Add Stock</Btn>
+              </Field>
+            </>
+          )}
+
+          <Inp label="Note (optional)" value={note} onChange={e=>setNote(e.target.value)} placeholder="Optional…" />
+          <BtnRow>
+            <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+            <Btn onClick={save}>Apply Action</Btn>
+          </BtnRow>
+        </>
+      )}
+    </Modal>
+  );
+}
+
 // ─── INVESTMENTS VIEW ─────────────────────────────────────────────────────────
 function InvestmentsView({ state, dispatch }) {
-  const [showAdd,setShowAdd] = useState(false);
-  const [tab,setTab]         = useState("holdings");
-  const holdings     = state?.holdings    ||[];
+  const [showAdd,          setShowAdd]          = useState(false);
+  const [showImport,       setShowImport]       = useState(false);
+  const [showCorpAction,   setShowCorpAction]   = useState(false);
+  const [showStocksMaster, setShowStocksMaster] = useState(false);
+  const [tab,              setTab]              = useState("holdings");
+  const [openHoldingId,    setOpenHoldingId]    = useState(null);
+  const [editHistoryTrade, setEditHistoryTrade] = useState(null);
+  const [bulkSelectMode,   setBulkSelectMode]   = useState(false);
+  const [selectedSymbols,  setSelectedSymbols]  = useState([]);
+  const [selectedTrades,   setSelectedTrades]   = useState(new Set()); // for bulk delete in history tab
+  const [refreshingPrices, setRefreshingPrices] = useState(false);
+
+  // Listen for FAB event from App
+  useEffect(()=>{
+    const h = ()=>setShowAdd(true);
+    document.addEventListener("wm:addTrade",h);
+    return ()=>document.removeEventListener("wm:addTrade",h);
+  },[]);
+
+  const accounts     = state?.accounts    ||[];
   const investmentTx = state?.investmentTx||[];
+  const fixedDeposits= state?.fixedDeposits||[];
   const fxRates      = state?.fxRates     ||DEFAULT.fxRates;
-  const stocks  = holdings.filter(h=>h.type==="stock");
-  const mfs     = holdings.filter(h=>h.type==="mf");
-  const stockVal= stocks.reduce((s,h)=>s+toINR(h.quantity*h.avgPrice,h.currency,fxRates),0);
-  const mfVal   = mfs.reduce((s,h)=>s+toINR(h.units*h.nav,h.currency,fxRates),0);
-  const sortedTx= [...investmentTx].sort((a,b)=>new Date(b.date)-new Date(a.date));
+  const marketPrices = state?.marketPrices ||{};
+
+  const holdings = state?.holdings||[];
+
+  const stocks = holdings.filter(h=>h.type==="stock");
+  const mfs    = holdings.filter(h=>h.type==="mf");
+  const holdingCurrentVal = h => {
+    const mp = marketPrices[h.symbol]?.current_price;
+    const qty = h.quantity||h.units||0;
+    return mp ? mp*qty : (h.investedAmount||h.quantity*h.avgPrice||h.units*h.nav||0);
+  };
+  const stockVal = stocks.reduce((s,h)=>s+toINR(holdingCurrentVal(h),h.currency,fxRates),0);
+  const mfVal    = mfs.reduce(  (s,h)=>s+toINR(holdingCurrentVal(h),h.currency,fxRates),0);
+  const fdVal    = fixedDeposits.reduce((s,fd)=>s+toINR(parseFloat(fd.amount)||0,fd.currency||"INR",fxRates),0);
+  const sortedTx = [...investmentTx].sort((a,b)=>new Date(b.date)-new Date(a.date));
+
+  function toggleHolding(id) {
+    setOpenHoldingId(prev => prev===id ? null : id);
+  }
+
+  function toggleBulkSelect(sym) {
+    setSelectedSymbols(prev => prev.includes(sym) ? prev.filter(s=>s!==sym) : [...prev,sym]);
+  }
+
+  function bulkDelete() {
+    if (selectedSymbols.length===0) return;
+    if (!window.confirm(`Delete ALL trades and holdings for: ${selectedSymbols.join(", ")}?\nThis cannot be undone.`)) return;
+    dispatch({type:"BULK_DELETE_HOLDINGS", payload:selectedSymbols});
+    setSelectedSymbols([]); setBulkSelectMode(false);
+    toast(`Deleted ${selectedSymbols.length} holding(s)`);
+  }
+
+  async function refreshAllPrices() {
+    const holdings = state?.holdings||[];
+    const symbols = [...new Set(holdings.map(h=>h.symbol))].filter(Boolean);
+    if (symbols.length===0) { toast("No holdings to refresh","error"); return; }
+    setRefreshingPrices(true);
+    toast(`🔄 Fetching prices for ${symbols.length} symbol(s)…`);
+    let updated = 0;
+    // Fetch one-by-one and dispatch immediately so UI updates as prices arrive
+    for (let i = 0; i < symbols.length; i++) {
+      const sym = symbols[i];
+      try {
+        const price = await fetchLivePrice(sym);
+        if (price && price > 0) {
+          dispatch({ type:"UPDATE_MARKET_PRICE", payload:{ symbol:sym, current_price:price } });
+          updated++;
+        }
+      } catch {}
+      if (i < symbols.length - 1) await new Promise(r => setTimeout(r, 300));
+    }
+    if (updated > 0) {
+      toast(`✅ Updated ${updated}/${symbols.length} prices`);
+    } else {
+      toast("Could not fetch prices — try setting manually", "error");
+    }
+    setRefreshingPrices(false);
+  }
 
   return (
     <div>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:8}}>
         <h2 style={{margin:0,fontSize:22,fontWeight:800,color:"#0F172A"}}>Investments</h2>
-        <Btn onClick={()=>setShowAdd(true)}>+ Trade</Btn>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+          <Btn variant="ghost" size="sm" onClick={()=>setShowStocksMaster(true)}>📚 Master</Btn>
+          <Btn variant="ghost" size="sm" onClick={()=>setShowImport(true)}>⬆️ Import</Btn>
+          <Btn variant="warning" size="sm" onClick={()=>setShowCorpAction(true)}>⚡ Corp.</Btn>
+          <button onClick={refreshAllPrices} disabled={refreshingPrices}
+            style={{fontSize:12,padding:"6px 12px",borderRadius:8,border:"1.5px solid #A7F3D0",background:refreshingPrices?"#F1F5F9":"#F0FDF4",color:refreshingPrices?"#94A3B8":"#065F46",cursor:refreshingPrices?"not-allowed":"pointer",fontFamily:"inherit",fontWeight:700,display:"flex",alignItems:"center",gap:5}}>
+            {refreshingPrices
+              ? <><span style={{display:"inline-block",width:10,height:10,border:"2px solid #A7F3D0",borderTopColor:"#10B981",borderRadius:"50%",animation:"spin 0.8s linear infinite"}}></span> Fetching…</>
+              : "🔄 Prices"}
+          </button>
+          <Btn size="sm" onClick={()=>setShowAdd(true)}>+ Trade</Btn>
+        </div>
       </div>
-      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20}}>
+
+      {/* Bulk delete toolbar */}
+      {tab==="holdings" && holdings.length>0 && (
+        <div style={{display:"flex",gap:8,marginBottom:12,alignItems:"center",flexWrap:"wrap"}}>
+          <button onClick={()=>{setBulkSelectMode(p=>!p);setSelectedSymbols([]);}}
+            style={{fontSize:12,padding:"5px 12px",borderRadius:8,border:"1.5px solid #E2E8F0",background:bulkSelectMode?"#EEF2FF":"#F8FAFC",color:bulkSelectMode?"#6366F1":"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+            {bulkSelectMode?"✕ Cancel":"☑️ Bulk Select"}
+          </button>
+          {bulkSelectMode && (() => {
+            const allSyms = [...new Set((state?.holdings||[]).map(h=>h.symbol))];
+            const allSelected = allSyms.length > 0 && allSyms.every(s=>selectedSymbols.includes(s));
+            return (
+              <button onClick={()=>setSelectedSymbols(allSelected ? [] : allSyms)}
+                style={{fontSize:12,padding:"5px 12px",borderRadius:8,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+                {allSelected ? "☐ Deselect All" : "☑ Select All"}
+              </button>
+            );
+          })()}
+          {bulkSelectMode && selectedSymbols.length>0 && (
+            <button onClick={bulkDelete}
+              style={{fontSize:12,padding:"5px 12px",borderRadius:8,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:700}}>
+              🗑️ Delete {selectedSymbols.length} Selected
+            </button>
+          )}
+          {bulkSelectMode && <span style={{fontSize:11,color:"#94A3B8"}}>Tap a holding to select · delete removes all trades</span>}
+        </div>
+      )}
+
+      {/* ── Portfolio Summary Bar (7): total invested, current value, P&L ── */}
+      {(stocks.length>0||mfs.length>0)&&(()=>{
+        const totalInvested = [...stocks,...mfs].reduce((s,h)=>s+toINR(h.investedAmount||0,h.currency,fxRates),0);
+        const totalCurrent  = [...stocks,...mfs].reduce((s,h)=>s+toINR(holdingCurrentVal(h),h.currency,fxRates),0);
+        const pnl           = totalCurrent - totalInvested;
+        const pnlPct        = totalInvested>0?(pnl/totalInvested)*100:0;
+        const isGain        = pnl>=0;
+        return (
+          <Card style={{marginBottom:16,background:"linear-gradient(135deg,#0F172A,#1E293B)",color:"#fff",padding:"16px 18px"}}>
+            <div style={{fontSize:11,color:"rgba(255,255,255,0.5)",fontWeight:600,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:10}}>Portfolio Summary</div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:12,marginBottom:12}}>
+              <div>
+                <div style={{fontSize:11,color:"rgba(255,255,255,0.5)",marginBottom:3}}>Total Invested</div>
+                <div style={{fontSize:20,fontWeight:800,color:"#fff"}}>{fmtINR(totalInvested)}</div>
+              </div>
+              <div>
+                <div style={{fontSize:11,color:"rgba(255,255,255,0.5)",marginBottom:3}}>Current Value</div>
+                <div style={{fontSize:20,fontWeight:800,color:"#A7F3D0"}}>{fmtINR(totalCurrent)}</div>
+              </div>
+            </div>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",background:"rgba(255,255,255,0.08)",borderRadius:10,padding:"10px 14px"}}>
+              <div>
+                <div style={{fontSize:11,color:"rgba(255,255,255,0.5)",marginBottom:2}}>Total P&L</div>
+                <div style={{fontSize:17,fontWeight:800,color:isGain?"#6EE7B7":"#FCA5A5"}}>
+                  {isGain?"+":"−"}{fmtINR(Math.abs(pnl))}
+                </div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:11,color:"rgba(255,255,255,0.5)",marginBottom:2}}>Returns</div>
+                <div style={{fontSize:20,fontWeight:800,color:isGain?"#6EE7B7":"#FCA5A5"}}>
+                  {isGain?"+":""}{pnlPct.toFixed(2)}%
+                </div>
+              </div>
+            </div>
+          </Card>
+        );
+      })()}
+
+      {/* Summary cards */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(min(100%,140px),1fr))",gap:10,marginBottom:20}}>
         {[
-          {label:"Portfolio",       value:fmtINR(stockVal+mfVal),color:"#6366F1",bg:"#EEF2FF",icon:"📊"},
-          {label:`Stocks (${stocks.length})`,  value:fmtINR(stockVal),     color:"#0EA5E9",bg:"#F0F9FF",icon:"📈"},
-          {label:`MFs (${mfs.length})`,        value:fmtINR(mfVal),        color:"#10B981",bg:"#F0FDF4",icon:"📉"},
+          {label:"Portfolio",        value:fmtINR(stockVal+mfVal+fdVal), color:"#6366F1", bg:"#EEF2FF", icon:"📊"},
+          {label:`Stocks (${stocks.length})`,  value:fmtINR(stockVal),  color:"#0EA5E9", bg:"#F0F9FF", icon:"📈"},
+          {label:`MF (${mfs.length})`,         value:fmtINR(mfVal),     color:"#10B981", bg:"#F0FDF4", icon:"📉"},
+          {label:`FD (${fixedDeposits.length})`,value:fmtINR(fdVal),    color:"#F59E0B", bg:"#FFFBEB", icon:"🏦"},
         ].map(s=>(
-          <Card key={s.label} style={{background:s.bg,padding:14,textAlign:"center"}}>
-            <div style={{fontSize:20,marginBottom:4}}>{s.icon}</div>
-            <div style={{fontSize:14,fontWeight:800,color:s.color}}>{s.value}</div>
-            <div style={{fontSize:11,color:"#64748B",marginTop:2}}>{s.label}</div>
+          <Card key={s.label} style={{background:s.bg,padding:12,textAlign:"center"}}>
+            <div style={{fontSize:18,marginBottom:4}}>{s.icon}</div>
+            <div style={{fontSize:13,fontWeight:800,color:s.color}}>{s.value}</div>
+            <div style={{fontSize:10,color:"#64748B",marginTop:2}}>{s.label}</div>
           </Card>
         ))}
       </div>
+
+      {/* Tab bar */}
       <div style={{display:"flex",gap:8,marginBottom:16,overflowX:"auto",paddingBottom:4}}>
-        {[["holdings","Holdings"],["history","Trade History"]].map(([k,l])=>(
+        {[["holdings","Holdings"],["fd","Fixed Deposits"],["history","Trade History"],["profits","Profits"]].map(([k,l])=>(
           <button key={k} onClick={()=>setTab(k)}
             style={{flexShrink:0,padding:"8px 18px",borderRadius:20,border:`2px solid ${tab===k?"#6366F1":"#E2E8F0"}`,background:tab===k?"#EEF2FF":"#fff",color:tab===k?"#6366F1":"#64748B",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>{l}</button>
         ))}
       </div>
+
+      {/* ── Holdings tab ── */}
       {tab==="holdings"&&(
         <div>
-          {holdings.length===0&&<Card style={{textAlign:"center",padding:48,color:"#94A3B8"}}><div style={{fontSize:48}}>📊</div><div style={{marginTop:8,fontWeight:600}}>No holdings yet</div></Card>}
+          {holdings.length===0&&(
+            <Card style={{textAlign:"center",padding:48,color:"#94A3B8"}}>
+              <div style={{fontSize:48}}>📊</div>
+              <div style={{marginTop:8,fontWeight:600}}>No holdings yet</div>
+              <div style={{fontSize:13,marginTop:4}}>Add a trade to get started</div>
+            </Card>
+          )}
           {stocks.length>0&&(
             <div style={{marginBottom:20}}>
-              <div style={{fontWeight:700,fontSize:13,color:"#475569",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:12}}>📊 Stocks</div>
-              <Card style={{padding:0,overflow:"auto"}}>
-                <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
-                  <thead><tr style={{background:"#F8FAFC"}}>{["Symbol","Shares","Avg Price","Value (INR)","Account"].map(h=><th key={h} style={{padding:"11px 14px",textAlign:"left",fontSize:11,fontWeight:700,color:"#64748B",textTransform:"uppercase",whiteSpace:"nowrap"}}>{h}</th>)}</tr></thead>
-                  <tbody>{stocks.map(h=>{
-                    const a=(state?.accounts||[]).find(a=>a.id===h.accountId);
-                    const cO=CURRENCIES.find(c=>c.code===h.currency)||CURRENCIES[0];
-                    return <tr key={h.id} style={{borderTop:"1px solid #F1F5F9"}}>
-                      <td style={{padding:"12px 14px",fontWeight:800,color:"#6366F1"}}>{h.symbol}</td>
-                      <td style={{padding:"12px 14px",fontWeight:600}}>{fmtNum(h.quantity)}</td>
-                      <td style={{padding:"12px 14px"}}>{cO.symbol}{fmtNum(h.avgPrice)}</td>
-                      <td style={{padding:"12px 14px",fontWeight:700}}>{fmtINR(toINR(h.quantity*h.avgPrice,h.currency,fxRates))}</td>
-                      <td style={{padding:"12px 14px",fontSize:12,color:"#94A3B8"}}>{a?.name}</td>
-                    </tr>;
-                  })}</tbody>
-                </table>
+              <div style={{fontWeight:700,fontSize:13,color:"#475569",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:10}}>📊 Stocks</div>
+              <Card style={{padding:0}}>
+                {stocks.map(h=>(
+                  <HoldingRow key={h.id} holding={h} investmentTx={investmentTx}
+                    accounts={accounts} state={state} dispatch={dispatch}
+                    openId={openHoldingId} onToggle={toggleHolding}
+                    bulkSelectMode={bulkSelectMode}
+                    isSelected={selectedSymbols.includes(h.symbol)}
+                    onBulkSelect={()=>toggleBulkSelect(h.symbol)} />
+                ))}
               </Card>
             </div>
           )}
           {mfs.length>0&&(
             <div>
-              <div style={{fontWeight:700,fontSize:13,color:"#475569",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:12}}>📈 Mutual Funds</div>
-              <Card style={{padding:0,overflow:"auto"}}>
-                <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
-                  <thead><tr style={{background:"#F8FAFC"}}>{["Fund","Units","NAV","Value (INR)","Account"].map(h=><th key={h} style={{padding:"11px 14px",textAlign:"left",fontSize:11,fontWeight:700,color:"#64748B",textTransform:"uppercase",whiteSpace:"nowrap"}}>{h}</th>)}</tr></thead>
-                  <tbody>{mfs.map(h=>{
-                    const a=(state?.accounts||[]).find(a=>a.id===h.accountId);
-                    return <tr key={h.id} style={{borderTop:"1px solid #F1F5F9"}}>
-                      <td style={{padding:"12px 14px"}}><div style={{fontWeight:700}}>{h.name}</div><div style={{fontSize:11,color:"#94A3B8"}}>{h.symbol}</div></td>
-                      <td style={{padding:"12px 14px",fontWeight:600}}>{fmtNum(h.units)}</td>
-                      <td style={{padding:"12px 14px"}}>{fmtCur(h.nav,h.currency||"INR")}</td>
-                      <td style={{padding:"12px 14px",fontWeight:700}}>{fmtINR(toINR(h.units*h.nav,h.currency,fxRates))}</td>
-                      <td style={{padding:"12px 14px",fontSize:12,color:"#94A3B8"}}>{a?.name}</td>
-                    </tr>;
-                  })}</tbody>
-                </table>
+              <div style={{fontWeight:700,fontSize:13,color:"#475569",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:10}}>📈 Mutual Funds</div>
+              <Card style={{padding:0}}>
+                {mfs.map(h=>(
+                  <HoldingRow key={h.id} holding={h} investmentTx={investmentTx}
+                    accounts={accounts} state={state} dispatch={dispatch}
+                    openId={openHoldingId} onToggle={toggleHolding}
+                    bulkSelectMode={bulkSelectMode}
+                    isSelected={selectedSymbols.includes(h.symbol)}
+                    onBulkSelect={()=>toggleBulkSelect(h.symbol)} />
+                ))}
               </Card>
             </div>
           )}
         </div>
       )}
-      {tab==="history"&&(
-        <Card style={{padding:0,overflow:"auto"}}>
-          {sortedTx.length===0?<div style={{textAlign:"center",padding:48,color:"#94A3B8"}}><div style={{fontSize:40}}>📭</div><div style={{marginTop:8}}>No trades yet</div></div>:(
-            <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
-              <thead><tr style={{background:"#F8FAFC"}}>{["Date","Type","Symbol","Qty","Price","Total (INR)"].map(h=><th key={h} style={{padding:"11px 14px",textAlign:"left",fontSize:11,fontWeight:700,color:"#64748B",textTransform:"uppercase",whiteSpace:"nowrap"}}>{h}</th>)}</tr></thead>
-              <tbody>{sortedTx.map(itx=>{
-                const h=holdings.find(h=>h.id===itx.holdingId);
-                const cur=itx.currency||"INR";
-                return <tr key={itx.id} style={{borderTop:"1px solid #F1F5F9"}}>
-                  <td style={{padding:"12px 14px",color:"#64748B",whiteSpace:"nowrap"}}>{fmtDate(itx.date)}</td>
-                  <td style={{padding:"12px 14px"}}><span style={{background:itx.type==="buy"?"#F0FDF4":"#FEF2F2",color:itx.type==="buy"?"#10B981":"#EF4444",padding:"3px 10px",borderRadius:20,fontWeight:700,fontSize:12}}>{itx.type.toUpperCase()}</span></td>
-                  <td style={{padding:"12px 14px",fontWeight:700,color:"#6366F1"}}>{h?.symbol||"—"}</td>
-                  <td style={{padding:"12px 14px"}}>{fmtNum(itx.quantity)}</td>
-                  <td style={{padding:"12px 14px"}}>{fmtCur(itx.price,cur)}</td>
-                  <td style={{padding:"12px 14px",fontWeight:700}}>{fmtINR(toINR(itx.quantity*itx.price,cur,fxRates))}</td>
-                </tr>;
-              })}</tbody>
-            </table>
+
+      {/* ── Fixed Deposits tab ── */}
+      {tab==="fd"&&(
+        <div>
+          {fixedDeposits.length===0&&(
+            <Card style={{textAlign:"center",padding:48,color:"#94A3B8"}}>
+              <div style={{fontSize:40}}>🏦</div>
+              <div style={{marginTop:8,fontWeight:600}}>No fixed deposits</div>
+              <div style={{fontSize:13,marginTop:4}}>Add a trade → select Fixed Deposit</div>
+            </Card>
           )}
-        </Card>
+          {fixedDeposits.map(fd=>(
+            <FDCard key={fd.id} fd={fd} accounts={accounts} dispatch={dispatch} state={state} />
+          ))}
+        </div>
       )}
-      {showAdd&&<InvestModal state={state} onClose={()=>setShowAdd(false)} onSave={d=>dispatch({type:"ADD_INVESTMENT",payload:d})} />}
+
+      {/* ── Trade History tab ── */}
+      {tab==="history"&&(
+        <div>
+          {/* Bulk-select toolbar */}
+          {sortedTx.length>0&&(
+            <div style={{display:"flex",gap:8,marginBottom:12,alignItems:"center",flexWrap:"wrap"}}>
+              <label style={{display:"flex",alignItems:"center",gap:6,fontSize:13,fontWeight:600,color:"#475569",cursor:"pointer",userSelect:"none"}}>
+                <input type="checkbox"
+                  checked={selectedTrades.size===sortedTx.length && sortedTx.length>0}
+                  onChange={e=>setSelectedTrades(e.target.checked ? new Set(sortedTx.map(t=>t.id)) : new Set())}
+                  style={{width:16,height:16,cursor:"pointer"}} />
+                Select All
+              </label>
+              {selectedTrades.size>0&&(
+                <button onClick={()=>{
+                  if(!window.confirm(`Delete ${selectedTrades.size} selected trade(s)? Holdings and balances will be recalculated.`))return;
+                  dispatch({type:"BULK_DELETE_INVESTMENT_TXS", payload:[...selectedTrades]});
+                  setSelectedTrades(new Set());
+                  toast(`${selectedTrades.size} trade(s) deleted — holdings recalculated`);
+                }} style={{fontSize:12,padding:"5px 14px",borderRadius:8,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:700}}>
+                  🗑️ Delete {selectedTrades.size} Selected
+                </button>
+              )}
+              {selectedTrades.size>0&&(
+                <button onClick={()=>setSelectedTrades(new Set())}
+                  style={{fontSize:12,padding:"5px 10px",borderRadius:8,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#64748B",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+                  ✕ Clear
+                </button>
+              )}
+            </div>
+          )}
+          {sortedTx.length===0
+            ? <Card style={{textAlign:"center",padding:48,color:"#94A3B8"}}><div style={{fontSize:40}}>📭</div><div style={{marginTop:8}}>No trades yet</div></Card>
+            : <div style={{display:"flex",flexDirection:"column",gap:0}}>
+                {sortedTx.map(itx=>{
+                  const h=holdings.find(h=>h.id===itx.holdingId);
+                  const cur=itx.currency||"INR";
+                  const total=(parseFloat(itx.quantity)||0)*(parseFloat(itx.price)||0);
+                  const srcAcc=accounts.find(a=>a.id===itx.sourceAccountId);
+                  const isChecked=selectedTrades.has(itx.id);
+                  return (
+                    <Card key={itx.id} style={{borderRadius:0,boxShadow:"none",borderBottom:"1px solid #F1F5F9",padding:"12px 14px",background:isChecked?"#FEF2F2":"#fff"}}>
+                      <div style={{display:"flex",alignItems:"flex-start",gap:10}}>
+                        <input type="checkbox" checked={isChecked}
+                          onChange={e=>{
+                            const s=new Set(selectedTrades);
+                            e.target.checked ? s.add(itx.id) : s.delete(itx.id);
+                            setSelectedTrades(s);
+                          }}
+                          style={{width:16,height:16,marginTop:3,cursor:"pointer",flexShrink:0}} />
+                        <span style={{fontSize:11,background:itx.type==="buy"?"#F0FDF4":"#FEF2F2",color:itx.type==="buy"?"#10B981":"#EF4444",padding:"3px 8px",borderRadius:10,fontWeight:700,flexShrink:0,marginTop:2}}>{itx.type.toUpperCase()}</span>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                            <span style={{fontWeight:800,color:"#6366F1",fontSize:14}}>{itx.symbol||h?.symbol||"—"}</span>
+                            <span style={{fontSize:12,color:"#0F172A",fontWeight:600}}>{fmtNum(itx.quantity)} × {fmtCur(itx.price,cur)}</span>
+                          </div>
+                          <div style={{fontSize:11,color:"#94A3B8",marginTop:2}}>
+                            {fmtDate(itx.date)}{srcAcc?` · ${srcAcc.name}`:""}{itx.note?` · ${itx.note}`:""}
+                          </div>
+                        </div>
+                        <div style={{textAlign:"right",flexShrink:0}}>
+                          <div style={{fontWeight:800,fontSize:14,color:itx.type==="buy"?"#EF4444":"#10B981"}}>
+                            {itx.type==="buy"?"−":"+"}{fmtINR(toINR(total,cur,fxRates))}
+                          </div>
+                          <div style={{fontSize:10,color:"#94A3B8"}}>{cur!=="INR"?fmtCur(total,cur):""}</div>
+                        </div>
+                      </div>
+                      <div style={{display:"flex",gap:8,marginTop:10,marginLeft:26}}>
+                        <button onClick={()=>setEditHistoryTrade(itx)}
+                          style={{flex:1,fontSize:12,padding:"6px 0",borderRadius:8,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+                          ✏️ Edit
+                        </button>
+                        <button onClick={()=>{
+                          if(!window.confirm("Delete this trade? Holdings and balances will be recalculated."))return;
+                          dispatch({type:"DELETE_INVESTMENT_TX",payload:itx.id});
+                          toast("Trade deleted — holdings recalculated");
+                        }} style={{flex:1,fontSize:12,padding:"6px 0",borderRadius:8,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+                          🗑️ Delete
+                        </button>
+                      </div>
+                    </Card>
+                  );
+                })}
+              </div>
+          }
+          {editHistoryTrade&&(
+            <InvestModal
+              state={state}
+              editTx={editHistoryTrade}
+              onClose={()=>setEditHistoryTrade(null)}
+              onSave={({itx})=>{
+                dispatch({type:"EDIT_INVESTMENT_TX",payload:itx});
+                setEditHistoryTrade(null);
+                toast("Trade updated — holdings recalculated");
+              }}
+            />
+          )}
+        </div>
+      )}
+
+      {/* ── Profits tab — FIFO realized P&L ── */}
+      {tab==="profits"&&(()=>{
+        const realized = buildRealizedTrades(investmentTx);
+        const netPnl   = realized.reduce((s,r)=>s+r.pnl,0);
+        const wins     = realized.filter(r=>r.pnl>0).length;
+        const losses   = realized.filter(r=>r.pnl<0).length;
+
+        // Group by symbol for cleaner display
+        const bySymbol = {};
+        realized.forEach(r=>{
+          if(!bySymbol[r.symbol]) bySymbol[r.symbol]={symbol:r.symbol,name:r.name,rows:[],total:0};
+          bySymbol[r.symbol].rows.push(r);
+          bySymbol[r.symbol].total += r.pnl;
+        });
+
+        return (
+          <div>
+            {/* Summary banner */}
+            <Card style={{background:netPnl>=0?"#F0FDF4":"#FEF2F2",border:`1.5px solid ${netPnl>=0?"#A7F3D0":"#FECACA"}`,marginBottom:16,padding:16}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
+                <div>
+                  <div style={{fontSize:11,color:"#64748B",marginBottom:2}}>Net Realized P&L</div>
+                  <div style={{fontSize:26,fontWeight:800,color:netPnl>=0?"#10B981":"#EF4444"}}>
+                    {netPnl>=0?"+":""}{fmtINR(netPnl)}
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:12}}>
+                  <div style={{textAlign:"center"}}>
+                    <div style={{fontSize:18,fontWeight:800,color:"#10B981"}}>{wins}</div>
+                    <div style={{fontSize:10,color:"#64748B"}}>Wins</div>
+                  </div>
+                  <div style={{textAlign:"center"}}>
+                    <div style={{fontSize:18,fontWeight:800,color:"#EF4444"}}>{losses}</div>
+                    <div style={{fontSize:10,color:"#64748B"}}>Losses</div>
+                  </div>
+                  <div style={{textAlign:"center"}}>
+                    <div style={{fontSize:18,fontWeight:800,color:"#6366F1"}}>{realized.length}</div>
+                    <div style={{fontSize:10,color:"#64748B"}}>Trades</div>
+                  </div>
+                </div>
+              </div>
+            </Card>
+
+            {realized.length===0&&(
+              <Card style={{textAlign:"center",padding:48,color:"#94A3B8"}}>
+                <div style={{fontSize:40}}>📊</div>
+                <div style={{marginTop:8,fontWeight:600}}>No closed trades yet</div>
+                <div style={{fontSize:13,marginTop:4}}>Sell a holding to see realized P&L here</div>
+              </Card>
+            )}
+
+            {/* Per-symbol groups */}
+            {Object.values(bySymbol).sort((a,b)=>Math.abs(b.total)-Math.abs(a.total)).map(group=>(
+              <Card key={group.symbol} style={{marginBottom:12,padding:0}}>
+                {/* Symbol header */}
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 14px",borderBottom:"1px solid #F1F5F9"}}>
+                  <div>
+                    <span style={{fontWeight:800,fontSize:15,color:"#0F172A"}}>{group.symbol}</span>
+                    <span style={{fontSize:11,color:"#94A3B8",marginLeft:6}}>{group.name}</span>
+                  </div>
+                  <span style={{fontWeight:800,fontSize:14,color:group.total>=0?"#10B981":"#EF4444"}}>
+                    {group.total>=0?"+":""}{fmtINR(group.total)}
+                  </span>
+                </div>
+                {/* Individual lot-matches */}
+                {group.rows.map((r,i)=>(
+                  <div key={r.id} style={{padding:"10px 14px",borderBottom:i<group.rows.length-1?"1px solid #F1F5F9":"none",background:r.pnl>=0?"#FAFFFE":"#FFFAFA"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:4}}>
+                          <span style={{fontSize:12,fontWeight:700,color:"#0F172A"}}>{fmtNum(r.qty)} share{r.qty!==1?"s":""}</span>
+                          <span style={{fontSize:11,background:"#FEF2F2",color:"#EF4444",padding:"2px 7px",borderRadius:8,fontWeight:700}}>
+                            BUY {fmtCur(r.buyPrice,r.currency)}
+                          </span>
+                          <span style={{fontSize:11,color:"#94A3B8"}}>→</span>
+                          <span style={{fontSize:11,background:"#F0FDF4",color:"#10B981",padding:"2px 7px",borderRadius:8,fontWeight:700}}>
+                            SELL {fmtCur(r.sellPrice,r.currency)}
+                          </span>
+                        </div>
+                        <div style={{fontSize:11,color:"#94A3B8"}}>
+                          Bought {fmtDate(r.buyDate)} · Sold {fmtDate(r.sellDate)}
+                        </div>
+                      </div>
+                      <div style={{textAlign:"right",flexShrink:0}}>
+                        <div style={{fontWeight:800,fontSize:14,color:r.pnl>=0?"#10B981":"#EF4444"}}>
+                          {r.pnl>=0?"+":""}{fmtINR(r.pnl)}
+                        </div>
+                        <div style={{fontSize:11,color:r.pnlPct>=0?"#10B981":"#EF4444",fontWeight:600}}>
+                          {r.pnlPct>=0?"+":""}{r.pnlPct.toFixed(2)}%
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </Card>
+            ))}
+          </div>
+        );
+      })()}
+
+      {showAdd&&(
+        <InvestModal state={state} onClose={()=>setShowAdd(false)}
+          onSave={({itx,newHolding,fd,isFD,autoAddStock})=>{
+            if(isFD){
+              dispatch({type:"ADD_FD",payload:fd});
+            } else {
+              // Auto-add to stocks master if not present
+              if(autoAddStock && !(state?.stocks||[]).find(s=>s.symbol===autoAddStock.symbol)) {
+                dispatch({type:"ADD_STOCK",payload:autoAddStock});
+              }
+              dispatch({type:"ADD_INVESTMENT",payload:{itx,newHolding}});
+            }
+          }}
+        />
+      )}
+      {showStocksMaster&&<StocksMasterModal state={state} dispatch={dispatch} onClose={()=>setShowStocksMaster(false)} />}
+      {showImport&&<ImportModal state={state} dispatch={dispatch} onClose={()=>setShowImport(false)} />}
+      {showCorpAction&&<CorporateActionModal state={state} dispatch={dispatch} onClose={()=>setShowCorpAction(false)} />}
     </div>
   );
 }
 
+
 // ─── REPORTS VIEW ─────────────────────────────────────────────────────────────
+// Layout: icon grid (row-based), with Expense by Category and P&L reports
 function ReportsView({ state }) {
-  const transactions = state?.transactions      ||[];
-  const expCats      = state?.expenseCategories ||DEFAULT.expenseCategories;
-  const incCats      = state?.incomeCategories   ||DEFAULT.incomeCategories;
-  const fxRates      = state?.fxRates            ||DEFAULT.fxRates;
-  const months = [...new Set(transactions.map(t=>{const d=new Date(t.date+"T00:00:00");return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;}))].sort().reverse();
+  const transactions  = state?.transactions      ||[];
+  const expCats       = state?.expenseCategories ||DEFAULT.expenseCategories;
+  const incCats       = state?.incomeCategories   ||DEFAULT.incomeCategories;
+  const fxRates       = state?.fxRates            ||DEFAULT.fxRates;
+  const holdings      = state?.holdings           ||[];
+  const fixedDeposits = state?.fixedDeposits      ||[];
+  const marketPrices  = state?.marketPrices       ||{};
+
+  // Sub-report state
+  const [activeReport, setActiveReport] = useState(null); // null | "expense_cat" | "pnl"
+  const [catDetail,    setCatDetail]    = useState(null); // selected category for drill-down
+
+  const months = [...new Set(transactions.map(t=>{const d=new Date(t.date+"T00:00:00");return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;}))] .sort().reverse();
   const [sel,setSel] = useState(months[0]||"");
 
   const mTxs = transactions.filter(t=>{
@@ -1964,78 +4328,265 @@ function ReportsView({ state }) {
     return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`===sel;
   });
 
-  const income  = mTxs.filter(t=>t.type==="income"&&!t.isRefund).reduce((s,t)=>s+toINR(t.amount,t.currency,fxRates),0);
-  // Net expense = gross - refunded
-  const grossExp   = mTxs.filter(t=>t.type==="expense").reduce((s,t)=>s+toINR(t.amount,t.currency,fxRates),0);
-  const totalRefund= mTxs.filter(t=>t.type==="expense").reduce((s,t)=>s+toINR(parseFloat(t.refundedAmount)||0,t.currency,fxRates),0);
-  const expense    = grossExp - totalRefund;
+  const income  = mTxs.filter(t=>t.type==="income"&&!(t.isRefund||t.is_refund)).reduce((s,t)=>s+toINR(t.amount,t.currency,fxRates),0);
+  const grossExp= mTxs.filter(t=>t.type==="expense").reduce((s,t)=>s+toINR(t.amount,t.currency,fxRates),0);
+  const totalRef= mTxs.filter(t=>t.type==="expense").reduce((s,t)=>s+toINR(parseFloat(t.refundedAmount)||0,t.currency,fxRates),0);
+  const expense = grossExp - totalRef;
 
   function breakdown(type, cats) {
     const m={};
     mTxs.filter(t=>t.type===type).forEach(t=>{
       const cat=cats.find(c=>c.id===t.categoryId);
-      const k=cat?`${cat.icon} ${cat.name}`:"Other";
-      const net = type==="expense" ? (parseFloat(t.amount)||0)-(parseFloat(t.refundedAmount)||0) : parseFloat(t.amount)||0;
+      const k=cat?cat.id:"other";
+      const net = type==="expense"?(parseFloat(t.amount)||0)-(parseFloat(t.refundedAmount)||0):parseFloat(t.amount)||0;
       m[k]=(m[k]||0)+toINR(net,t.currency,fxRates);
     });
-    return Object.entries(m).sort((a,b)=>b[1]-a[1]);
+    return Object.entries(m).map(([id,val])=>{
+      const cat=cats.find(c=>c.id===id);
+      return {id,label:cat?`${cat.icon} ${cat.name}`:"🏷️ Other",val};
+    }).sort((a,b)=>b.val-a.val);
   }
-  const expBreak=breakdown("expense",expCats), incBreak=breakdown("income",incCats);
-  const maxExp=Math.max(...expBreak.map(e=>e[1]),1), maxInc=Math.max(...incBreak.map(e=>e[1]),1);
+  const expBreak=breakdown("expense",expCats);
+  const total=expBreak.reduce((s,r)=>s+r.val,0)||1;
 
+  // Pie chart colors
+  const PIE_COLORS=["#6366F1","#10B981","#F59E0B","#EF4444","#3B82F6","#EC4899","#8B5CF6","#06B6D4","#84CC16","#D97706"];
+
+  // Drill-down transactions for a category
+  const catTxs = catDetail ? mTxs.filter(t=>t.type==="expense"&&t.categoryId===catDetail) : [];
+
+  // P&L data — CLOSED trades only (FIFO realized), not open holdings
+  function getPnlRows() {
+    const investmentTx = state?.investmentTx || [];
+    const realized = buildRealizedTrades(investmentTx);
+
+    // Aggregate by symbol: sum up pnl, buy cost, sell value
+    const bySymbol = {};
+    realized.forEach(r => {
+      if (!bySymbol[r.symbol]) {
+        bySymbol[r.symbol] = {
+          type:     r.type === "mf" ? "MF" : "Stock",
+          symbol:   r.symbol,
+          name:     r.name,
+          costBasis:  0,
+          sellValue:  0,
+          pnl:        0,
+          qty:        0,
+        };
+      }
+      const g = bySymbol[r.symbol];
+      g.costBasis += r.buyPrice  * r.qty;
+      g.sellValue += r.sellPrice * r.qty;
+      g.pnl       += r.pnl;
+      g.qty       += r.qty;
+    });
+
+    return Object.values(bySymbol).map(g => ({
+      type:     g.type,
+      symbol:   g.symbol,
+      name:     g.name,
+      invested: g.costBasis,
+      current:  g.sellValue,
+      pnl:      g.pnl,
+      pct:      g.costBasis > 0 ? (g.pnl / g.costBasis) * 100 : null,
+    }));
+  }
+
+  // Report icon grid
+  const REPORTS = [
+    {id:"expense_cat", icon:"🥧", title:"Expense by Category", desc:"Pie chart breakdown"},
+    {id:"pnl",         icon:"📈", title:"Profit & Loss",        desc:"Stocks, MF, FDs"},
+  ];
+
+  if (activeReport==="expense_cat") {
+    return (
+      <div>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:20}}>
+          <button onClick={()=>{setActiveReport(null);setCatDetail(null);}} style={{background:"none",border:"none",fontSize:18,cursor:"pointer",color:"#6366F1"}}>←</button>
+          <h2 style={{margin:0,fontSize:20,fontWeight:800,color:"#0F172A"}}>Expense by Category</h2>
+          <select value={sel} onChange={e=>setSel(e.target.value)} style={{marginLeft:"auto",border:"1.5px solid #E2E8F0",borderRadius:10,padding:"7px 12px",fontSize:14,fontFamily:"inherit",outline:"none"}}>
+            <option value="">All Time</option>
+            {months.map(m=><option key={m} value={m}>{m}</option>)}
+          </select>
+        </div>
+
+        {/* SVG Pie Chart */}
+        {expBreak.length>0&&(()=>{
+          const cx=120,cy=120,r=90,gap=2;
+          let cumAngle=-Math.PI/2;
+          const slices=expBreak.map((item,i)=>{
+            const pct=item.val/total;
+            const angle=pct*Math.PI*2;
+            const x1=cx+r*Math.cos(cumAngle), y1=cy+r*Math.sin(cumAngle);
+            cumAngle+=angle;
+            const x2=cx+r*Math.cos(cumAngle), y2=cy+r*Math.sin(cumAngle);
+            const large=angle>Math.PI?1:0;
+            const path=`M${cx},${cy} L${x1},${y1} A${r},${r} 0 ${large},1 ${x2},${y2} Z`;
+            return {...item,path,color:PIE_COLORS[i%PIE_COLORS.length],pct:pct*100};
+          });
+          return (
+            <div style={{display:"flex",flexDirection:"column",alignItems:"center",marginBottom:20}}>
+              <svg width={240} height={240} viewBox="0 0 240 240">
+                {slices.map((s,i)=>(
+                  <path key={i} d={s.path} fill={catDetail===s.id?s.color+"dd":s.color}
+                    stroke="#fff" strokeWidth={gap} cursor="pointer"
+                    onClick={()=>setCatDetail(catDetail===s.id?null:s.id)} />
+                ))}
+                <circle cx={cx} cy={cy} r={50} fill="#fff"/>
+                <text x={cx} y={cy} textAnchor="middle" dominantBaseline="middle" fontSize={11} fontWeight={700} fill="#0F172A">{fmtINR(expense)}</text>
+              </svg>
+              {/* Legend */}
+              <div style={{display:"flex",flexWrap:"wrap",gap:8,justifyContent:"center"}}>
+                {slices.map((s,i)=>(
+                  <button key={i} onClick={()=>setCatDetail(catDetail===s.id?null:s.id)}
+                    style={{display:"flex",alignItems:"center",gap:5,padding:"4px 10px",borderRadius:20,border:`1.5px solid ${catDetail===s.id?s.color:"#E2E8F0"}`,background:catDetail===s.id?s.color+"22":"#fff",cursor:"pointer",fontFamily:"inherit"}}>
+                    <div style={{width:10,height:10,borderRadius:"50%",background:s.color,flexShrink:0}}/>
+                    <span style={{fontSize:11,fontWeight:600,color:"#0F172A"}}>{s.label}</span>
+                    <span style={{fontSize:11,color:"#64748B"}}>{s.pct.toFixed(1)}%</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* Bar chart */}
+        {expBreak.length>0&&(
+          <Card style={{marginBottom:16}}>
+            <div style={{fontWeight:700,fontSize:14,marginBottom:12}}>📊 Breakdown</div>
+            {expBreak.map((item,i)=>(
+              <div key={item.id} style={{marginBottom:10,cursor:"pointer"}} onClick={()=>setCatDetail(catDetail===item.id?null:item.id)}>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:3,fontSize:13}}>
+                  <span style={{fontWeight:600,color:catDetail===item.id?"#6366F1":"#0F172A"}}>{item.label}</span>
+                  <span style={{fontWeight:700,color:"#EF4444"}}>{fmtINR(item.val)}</span>
+                </div>
+                <div style={{background:"#F1F5F9",borderRadius:20,height:7,overflow:"hidden"}}>
+                  <div style={{background:PIE_COLORS[i%PIE_COLORS.length],height:"100%",borderRadius:20,width:`${(item.val/total)*100}%`}}/>
+                </div>
+              </div>
+            ))}
+          </Card>
+        )}
+
+        {/* Drill-down transactions */}
+        {catDetail&&catTxs.length>0&&(
+          <Card>
+            <div style={{fontWeight:700,fontSize:14,marginBottom:12}}>
+              {expCats.find(c=>c.id===catDetail)?.icon} {expCats.find(c=>c.id===catDetail)?.name||"Other"} Transactions
+            </div>
+            {catTxs.sort((a,b)=>new Date(b.date)-new Date(a.date)).map(tx=>(
+              <div key={tx.id} style={{display:"flex",justifyContent:"space-between",padding:"9px 0",borderBottom:"1px solid #F1F5F9",fontSize:13}}>
+                <div>
+                  <div style={{fontWeight:600,color:"#0F172A"}}>{tx.note||"—"}</div>
+                  <div style={{fontSize:11,color:"#94A3B8"}}>{fmtDate(tx.date)}</div>
+                </div>
+                <div style={{fontWeight:700,color:"#EF4444"}}>{fmtCur(parseFloat(tx.amount)||0,tx.currency||"INR")}</div>
+              </div>
+            ))}
+          </Card>
+        )}
+        {expBreak.length===0&&<Card style={{textAlign:"center",padding:48,color:"#94A3B8"}}><div>No expenses found for this period</div></Card>}
+      </div>
+    );
+  }
+
+  if (activeReport==="pnl") {
+    const pnlRows=getPnlRows();
+    const totalCost=pnlRows.reduce((s,r)=>s+r.invested,0);
+    const totalSell=pnlRows.reduce((s,r)=>s+r.current,0);
+    const totalPnl =pnlRows.reduce((s,r)=>s+r.pnl,0);
+    return (
+      <div>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:20}}>
+          <button onClick={()=>setActiveReport(null)} style={{background:"none",border:"none",fontSize:18,cursor:"pointer",color:"#6366F1"}}>←</button>
+          <h2 style={{margin:0,fontSize:20,fontWeight:800,color:"#0F172A"}}>Realized P&L</h2>
+          <span style={{fontSize:12,color:"#94A3B8",marginLeft:4}}>Closed trades only</span>
+        </div>
+        {/* Summary */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:16}}>
+          {[
+            {label:"Total Cost Basis", val:fmtINR(totalCost),  color:"#0F172A",bg:"#F8FAFC"},
+            {label:"Total Sell Value", val:fmtINR(totalSell),  color:"#6366F1",bg:"#EEF2FF"},
+            {label:"Net Realized P&L", val:`${totalPnl>=0?"+":""}${fmtINR(totalPnl)}`,color:totalPnl>=0?"#10B981":"#EF4444",bg:totalPnl>=0?"#F0FDF4":"#FEF2F2"},
+          ].map(s=>(
+            <Card key={s.label} style={{background:s.bg,padding:12,textAlign:"center"}}>
+              <div style={{fontSize:13,fontWeight:800,color:s.color}}>{s.val}</div>
+              <div style={{fontSize:10,color:"#64748B",marginTop:2}}>{s.label}</div>
+            </Card>
+          ))}
+        </div>
+        {/* Rows */}
+        {["Stock","MF"].map(type=>{
+          const rows=pnlRows.filter(r=>r.type===type);
+          if(rows.length===0) return null;
+          return (
+            <Card key={type} style={{marginBottom:12,padding:0}}>
+              <div style={{padding:"10px 14px",borderBottom:"1px solid #F1F5F9",fontWeight:700,fontSize:13,color:"#475569"}}>
+                {type==="Stock"?"📊 Stocks":"📈 Mutual Funds"}
+              </div>
+              {rows.map((r,i)=>(
+                <div key={i} style={{padding:"10px 14px",borderBottom:i<rows.length-1?"1px solid #F1F5F9":"none"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:3}}>
+                    <div>
+                      <span style={{fontWeight:700,fontSize:13,color:"#0F172A"}}>{r.symbol}</span>
+                      <span style={{fontSize:11,color:"#94A3B8",marginLeft:6}}>{r.name}</span>
+                    </div>
+                    <span style={{fontWeight:700,fontSize:13,color:r.pnl>=0?"#10B981":"#EF4444"}}>{r.pnl>=0?"+":""}{fmtINR(r.pnl)}</span>
+                  </div>
+                  <div style={{display:"flex",gap:16,fontSize:11,color:"#64748B"}}>
+                    <span>Cost: {fmtINR(r.invested)}</span>
+                    <span>Sold: {fmtINR(r.current)}</span>
+                    {r.pct!==null&&<span style={{fontWeight:600,color:r.pct>=0?"#10B981":"#EF4444"}}>{r.pct>=0?"+":""}{r.pct.toFixed(1)}%</span>}
+                  </div>
+                </div>
+              ))}
+            </Card>
+          );
+        })}
+        {pnlRows.length===0&&(
+          <Card style={{textAlign:"center",padding:48,color:"#94A3B8"}}>
+            <div style={{fontSize:40}}>📊</div>
+            <div style={{marginTop:8,fontWeight:600}}>No closed trades yet</div>
+            <div style={{fontSize:13,marginTop:4}}>Sell a holding to see realized P&L here</div>
+          </Card>
+        )}
+      </div>
+    );
+  }
+
+  // ── Main Reports landing page ──────────────────────────────────────────────
   return (
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,flexWrap:"wrap",gap:8}}>
         <h2 style={{margin:0,fontSize:22,fontWeight:800,color:"#0F172A"}}>Reports</h2>
-        <select value={sel} onChange={e=>setSel(e.target.value)} style={{border:"1.5px solid #E2E8F0",borderRadius:10,padding:"8px 14px",fontSize:14,fontFamily:"inherit",outline:"none"}}>
-          <option value="">All Time</option>
-          {months.map(m=><option key={m} value={m}>{m}</option>)}
-        </select>
       </div>
-      <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:12,marginBottom:20}}>
+
+      {/* Quick summary */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:10,marginBottom:24}}>
         {[
-          {label:"Income",    value:fmtINR(income),         color:"#10B981",bg:"#F0FDF4"},
-          {label:"Net Expense",value:fmtINR(expense),       color:"#EF4444",bg:"#FEF2F2"},
-          {label:"Savings",   value:fmtINR(income-expense),color:income-expense>=0?"#6366F1":"#EF4444",bg:"#EEF2FF"},
-          {label:"Refunds",   value:fmtINR(totalRefund),    color:"#D97706",bg:"#FFFBEB"},
-        ].map(s=><Card key={s.label} style={{background:s.bg,padding:16}}><div style={{fontSize:20,fontWeight:800,color:s.color}}>{s.value}</div><div style={{fontSize:12,color:"#64748B",marginTop:4}}>{s.label}</div></Card>)}
+          {label:"Month Income",  value:fmtINR(income),   color:"#10B981",bg:"#F0FDF4"},
+          {label:"Month Expense", value:fmtINR(expense),  color:"#EF4444",bg:"#FEF2F2"},
+          {label:"Savings",       value:fmtINR(income-expense), color:income-expense>=0?"#6366F1":"#EF4444",bg:"#EEF2FF"},
+          {label:"Refunds",       value:fmtINR(totalRef), color:"#D97706",bg:"#FFFBEB"},
+        ].map(s=>(
+          <Card key={s.label} style={{background:s.bg,padding:14}}>
+            <div style={{fontSize:16,fontWeight:800,color:s.color}}>{s.value}</div>
+            <div style={{fontSize:12,color:"#64748B",marginTop:4}}>{s.label}</div>
+          </Card>
+        ))}
       </div>
-      {income>0&&(
-        <Card style={{marginBottom:16}}>
-          <div style={{fontWeight:700,fontSize:15,marginBottom:12}}>Savings Rate</div>
-          <div style={{background:"#F1F5F9",borderRadius:20,height:16,overflow:"hidden"}}>
-            <div style={{background:"linear-gradient(90deg,#6366F1,#8B5CF6)",height:"100%",borderRadius:20,width:`${Math.min(100,Math.max(0,((income-expense)/income)*100))}%`}}/>
-          </div>
-          <div style={{marginTop:8,fontSize:14,color:"#475569"}}>{Math.round(((income-expense)/income)*100)}% saved this period</div>
-        </Card>
-      )}
-      <div style={{display:"flex",flexDirection:"column",gap:16}}>
-        {expBreak.length>0&&(
-          <Card>
-            <div style={{fontWeight:700,fontSize:15,marginBottom:16}}>📤 Net Expense by Category</div>
-            {expBreak.map(([cat,amt])=>(
-              <div key={cat} style={{marginBottom:14}}>
-                <div style={{display:"flex",justifyContent:"space-between",marginBottom:5,fontSize:14}}>
-                  <span style={{fontWeight:600}}>{cat}</span><span style={{fontWeight:700,color:"#EF4444"}}>{fmtINR(amt)}</span>
-                </div>
-                <div style={{background:"#F1F5F9",borderRadius:20,height:8,overflow:"hidden"}}><div style={{background:"#EF4444",height:"100%",borderRadius:20,width:`${(amt/maxExp)*100}%`}}/></div>
-              </div>
-            ))}
-          </Card>
-        )}
-        {incBreak.length>0&&(
-          <Card>
-            <div style={{fontWeight:700,fontSize:15,marginBottom:16}}>📥 Income by Category</div>
-            {incBreak.map(([cat,amt])=>(
-              <div key={cat} style={{marginBottom:14}}>
-                <div style={{display:"flex",justifyContent:"space-between",marginBottom:5,fontSize:14}}>
-                  <span style={{fontWeight:600}}>{cat}</span><span style={{fontWeight:700,color:"#10B981"}}>{fmtINR(amt)}</span>
-                </div>
-                <div style={{background:"#F1F5F9",borderRadius:20,height:8,overflow:"hidden"}}><div style={{background:"#10B981",height:"100%",borderRadius:20,width:`${(amt/maxInc)*100}%`}}/></div>
-              </div>
-            ))}
-          </Card>
-        )}
+
+      {/* Report icons grid — 2 per row */}
+      <div style={{marginBottom:16,fontSize:12,color:"#64748B",fontWeight:600,textTransform:"uppercase",letterSpacing:"0.05em"}}>Available Reports</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:12}}>
+        {REPORTS.map(rpt=>(
+          <button key={rpt.id} onClick={()=>setActiveReport(rpt.id)}
+            style={{background:"#fff",borderRadius:16,padding:"20px 16px",border:"1.5px solid #E2E8F0",cursor:"pointer",fontFamily:"inherit",textAlign:"center",boxShadow:"0 2px 8px rgba(0,0,0,0.05)",transition:"all 0.15s"}}>
+            <div style={{fontSize:36,marginBottom:10}}>{rpt.icon}</div>
+            <div style={{fontWeight:700,fontSize:14,color:"#0F172A",marginBottom:4}}>{rpt.title}</div>
+            <div style={{fontSize:11,color:"#94A3B8"}}>{rpt.desc}</div>
+          </button>
+        ))}
       </div>
     </div>
   );
@@ -2241,11 +4792,15 @@ export default function App() {
   const [user,        setUser]        = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [state,       dispatch]       = useReducer(reducer, undefined, loadLocal);
-  const [view,        setView]        = useState("dashboard");
+  const [view,        setView]        = useState(() => {
+    try { return localStorage.getItem("wealthmap_view") || "dashboard"; } catch { return "dashboard"; }
+  });
   const [online,      setOnline]      = useState(typeof navigator!=="undefined"?navigator.onLine:true);
   const [quickAdd,    setQuickAdd]    = useState(false);
   const [showProfile, setShowProfile] = useState(false);
   const [syncStatus,  setSyncStatus]  = useState("idle");
+  // Context-aware FAB: each view can register its own action
+  const fabActionRef = useRef(null);
 
   // Toast system
   const toasts = useToastSystem();
@@ -2323,6 +4878,40 @@ export default function App() {
     setShowProfile(false);
   }
 
+  // Persist view to localStorage whenever it changes
+  useEffect(() => {
+    try { localStorage.setItem("wealthmap_view", view); } catch {}
+  }, [view]);
+
+  // ── Live price auto-fetch: refresh all stock/MF prices every 5 minutes
+  useEffect(() => {
+    const stocks = stateRef.current?.stocks || [];
+    if (stocks.length === 0) return;
+    async function refreshPrices() {
+      const symbols = stocks.map(s => s.symbol).filter(Boolean);
+      if (symbols.length === 0) return;
+      try {
+        const prices = await fetchMultiplePrices(symbols);
+        Object.entries(prices).forEach(([sym, price]) => {
+          dispatch({ type: "UPDATE_MARKET_PRICE", payload: { symbol: sym, current_price: price } });
+        });
+      } catch { /* silent fail */ }
+    }
+    refreshPrices(); // immediate on mount
+    const interval = setInterval(refreshPrices, 5 * 60 * 1000); // every 5 min
+    return () => clearInterval(interval);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // FAB config per view
+  const fabConfig = {
+    dashboard:    { label:"Add",          icon:"＋", action:()=>setQuickAdd(true) },
+    transactions: { label:"Add",          icon:"＋", action:()=>setQuickAdd(true) },
+    accounts:     { label:"Add Account",  icon:"🏦", action:()=>{ document.dispatchEvent(new CustomEvent("wm:addAccount")); } },
+    investments:  { label:"Add Trade",    icon:"📊", action:()=>{ document.dispatchEvent(new CustomEvent("wm:addTrade")); } },
+    reports:      { label:null,           icon:null, action:null }, // no FAB on reports
+  };
+  const fab = fabConfig[view] || fabConfig.dashboard;
+
   if (authLoading) return (
     <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#F8FAFC"}}>
       <div style={{textAlign:"center"}}>
@@ -2380,26 +4969,27 @@ export default function App() {
         {view==="reports"      && <ReportsView      state={state} />}
       </div>
 
-      {/* ── FAB: floating "+ Add" button ─────────────────────────────────────── */}
-      {/* Desktop: fixed bottom-right. Mobile: fixed bottom-center above nav bar.  */}
-      <button
-        onClick={()=>setQuickAdd(true)}
-        className="fab-add"
-        style={{
-          position:"fixed", zIndex:200,
-          background:"linear-gradient(135deg,#6366F1,#8B5CF6)",
-          color:"#fff", border:"none", borderRadius:28,
-          boxShadow:"0 6px 24px rgba(99,102,241,0.45)",
-          cursor:"pointer", fontFamily:"inherit",
-          display:"flex", alignItems:"center", gap:8,
-          fontWeight:700, fontSize:16,
-          padding:"14px 22px",
-        }}
-        aria-label="Add transaction"
-      >
-        <span style={{fontSize:22,lineHeight:1}}>＋</span>
-        <span className="fab-label">Add</span>
-      </button>
+      {/* ── Context-aware FAB ─────────────────────────────────────────────────── */}
+      {fab.action&&(
+        <button
+          onClick={fab.action}
+          className="fab-add"
+          style={{
+            position:"fixed", zIndex:200,
+            background:"linear-gradient(135deg,#6366F1,#8B5CF6)",
+            color:"#fff", border:"none", borderRadius:28,
+            boxShadow:"0 6px 24px rgba(99,102,241,0.45)",
+            cursor:"pointer", fontFamily:"inherit",
+            display:"flex", alignItems:"center", gap:8,
+            fontWeight:700, fontSize:16,
+            padding:"14px 22px",
+          }}
+          aria-label={fab.label||"Add"}
+        >
+          <span style={{fontSize:22,lineHeight:1}}>{fab.icon}</span>
+          <span className="fab-label">{fab.label!=="Add"?fab.label:""}</span>
+        </button>
+      )}
 
       {/* ── Quick add transaction modal ── */}
       {quickAdd&&<TxModalWithDispatch state={state} dispatch={dispatch} onClose={()=>setQuickAdd(false)} onSave={tx=>{dispatch({type:"ADD_TX",payload:tx});setQuickAdd(false);}} />}
@@ -2427,6 +5017,9 @@ export default function App() {
 
       {/* ── Toast container ── */}
       <ToastContainer toasts={toasts} />
+
+      {/* SheetJS for XLSX import */}
+      {typeof window!=="undefined"&&!window.XLSX&&(<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" />)}
 
       {/* ── Global styles ── */}
       <style>{`
