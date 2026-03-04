@@ -3173,19 +3173,8 @@ function HoldingRow({ holding, investmentTx, accounts, state, dispatch, openId, 
           </div>
         </div>
         <div style={{textAlign:"right",flexShrink:0}}>
-          {livePrice ? (
-            <>
-              <div style={{fontWeight:700,fontSize:14}}>{fmtCur(currentVal,cur)}</div>
-              <div style={{fontSize:11,fontWeight:600,color:totalDiff>=0?"#10B981":"#EF4444"}}>
-                {totalDiff>=0?"▲":"▼"}{Math.abs(pctDiff).toFixed(1)}%
-              </div>
-            </>
-          ) : (
-            <>
-              <div style={{fontWeight:700,fontSize:14}}>{fmtCur(investedAmt,cur)}</div>
-              <div style={{fontSize:11,color:"#94A3B8"}}>invested</div>
-            </>
-          )}
+          <div style={{fontWeight:700,fontSize:14}}>{fmtCur(investedAmt,cur)}</div>
+          <div style={{fontSize:11,color:"#94A3B8"}}>invested</div>
         </div>
         <span style={{color:"#94A3B8",fontSize:12,flexShrink:0}}>{isOpen?"▲":"▼"}</span>
       </div>
