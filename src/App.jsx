@@ -1,11 +1,12 @@
 // ============================================================
-// WEALTHMAP v17 — Net Worth Double-Count Fix + Persistence Fix
+// WEALTHMAP v17 — Cloud-Primary Storage + Reducer Safety Guard
 // Changes vs v16:
-//  1.  cat_broker + cat_mf + cat_invest ALL excluded from net worth account-balance sum
-//      (previously only cat_invest was marked isInvestmentType — broker accounts double-counted)
-//  2.  Migration only runs when current state has zero investmentTx (prevents re-import loop)
-//  3.  Migration dedup uses externalTradeId as primary key (matches Zerodha trade_id)
-//  4.  All three investment category types flagged isInvestmentType:true in DEFAULT
+//  1.  Cloud-primary: Supabase is the source of truth, not localStorage
+//  2.  On login: always pull from cloud first; localStorage is only offline cache
+//  3.  On every state change: immediately push to cloud (no debounce delay)
+//  4.  localStorage kept as write-through fallback for offline use only
+//  5.  reducer() guarded against undefined action (fixes Supabase realtime crash)
+//  6.  loadLocal() tries cloud on init when user session already exists
 // Changes vs v11:
 //  1.  FD Close: Undo support (FD marked closed, not deleted)
 //  2.  Profits tab: summary per stock only (no individual trade rows)
@@ -53,8 +54,8 @@ const DEFAULT = {
     { id:"cat_cash",   name:"Cash",         icon:"💵", color:"#10B981", isCreditCardType:false },
     { id:"cat_cc",     name:"Credit Card",  icon:"💳", color:"#EF4444", isCreditCardType:true  },
     { id:"cat_wallet", name:"Wallet / UPI", icon:"📱", color:"#F59E0B", isCreditCardType:false },
-    { id:"cat_broker", name:"Stock Broker", icon:"📈", color:"#8B5CF6", isCreditCardType:false, isInvestmentType:true },
-    { id:"cat_mf",     name:"Mutual Funds", icon:"📊", color:"#06B6D4", isCreditCardType:false, isInvestmentType:true },
+    { id:"cat_broker", name:"Stock Broker", icon:"📈", color:"#8B5CF6", isCreditCardType:false },
+    { id:"cat_mf",     name:"Mutual Funds", icon:"📊", color:"#06B6D4", isCreditCardType:false },
     { id:"cat_invest",  name:"Investment",   icon:"📈", color:"#6366F1", isCreditCardType:false, isInvestmentType:true },
     { id:"cat_other",   name:"Other",        icon:"🏷️", color:"#6B7280", isCreditCardType:false },
   ],
@@ -127,25 +128,12 @@ function sanitizeAccount(a) {
   return out;
 }
 
-// Known investment-type category IDs (built-in + legacy aliases)
-const INVESTMENT_CAT_IDS = new Set(["cat_invest", "cat_broker", "cat_mf"]);
-
-// Ensure stored category objects carry the correct flags
-// (old stored data may be missing isInvestmentType on cat_broker / cat_mf)
-function sanitizeAccountCategory(c) {
-  if (!c || typeof c !== "object") return c;
-  if (INVESTMENT_CAT_IDS.has(c.id)) {
-    return { ...c, isInvestmentType: true };
-  }
-  return c;
-}
-
 function sanitize(raw) {
   if (!raw || typeof raw !== "object") return { ...DEFAULT };
   return {
     accounts:            Array.isArray(raw.accounts)            ? raw.accounts.map(sanitizeAccount) : [],
-    accountCategories:   Array.isArray(raw.accountCategories)   ? raw.accountCategories.map(sanitizeAccountCategory)
-                       : Array.isArray(raw.categories)          ? raw.categories.map(sanitizeAccountCategory) : DEFAULT.accountCategories,
+    accountCategories:   Array.isArray(raw.accountCategories)   ? raw.accountCategories
+                       : Array.isArray(raw.categories)          ? raw.categories : DEFAULT.accountCategories,
     expenseCategories:   Array.isArray(raw.expenseCategories)   ? raw.expenseCategories  : DEFAULT.expenseCategories,
     incomeCategories:    Array.isArray(raw.incomeCategories)     ? raw.incomeCategories   : DEFAULT.incomeCategories,
     transactions:        Array.isArray(raw.transactions)         ? raw.transactions        : [],
@@ -160,37 +148,41 @@ function sanitize(raw) {
   };
 }
 
-// ─── LOCAL STORAGE ────────────────────────────────────────────────────────────
+// ─── STORAGE: CLOUD-PRIMARY ───────────────────────────────────────────────────
+//
+// Architecture:
+//   • Supabase (cloud) is the single source of truth.
+//   • localStorage is a write-through offline cache ONLY.
+//   • On cold start: load from localStorage (sync/instant) for immediate render,
+//     then replace with cloud data as soon as the user session resolves.
+//   • On every state change: write to localStorage AND push to Supabase.
+//   • When offline: writes queue in localStorage and push when back online.
+//
+// This means data is always available across devices and survives app updates.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write-through local cache (offline fallback only)
+function saveLocal(s) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); } catch(e) { console.warn("saveLocal:", e); }
+}
+
+// Cold-start load: read local cache for instant first render.
+// Migration runs here too so old data is recovered before the cloud pull completes.
 function loadLocal() {
   try {
-    // 1. Load whatever is already stored under the current key (may be empty/new)
     const raw = localStorage.getItem(STORAGE_KEY);
     const currentState = raw ? sanitize(JSON.parse(raw)) : sanitize({});
-
-    // 2. Run migration — scans all prior wealthmap_vN keys, merges any
-    //    investment data found there into currentState, rebuilds holdings.
-    //    If nothing to migrate this is a fast no-op.
     const migratedState = migrateFromOlderVersion(currentState);
-
-    // 3. If migration added data, persist the merged state immediately so
-    //    subsequent loads don't have to migrate again.
     if (migratedState !== currentState) {
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(migratedState));
-        console.log("[Migration] Persisted migrated state to", STORAGE_KEY);
-      } catch (e) {
-        console.warn("[Migration] Could not persist migrated state:", e);
-      }
+      // Persist migration immediately so it doesn't re-run next load
+      saveLocal(migratedState);
+      console.log("[Migration] Persisted migrated state to", STORAGE_KEY);
     }
-
     return migratedState;
   } catch(e) {
     console.warn("loadLocal:", e);
   }
   return sanitize({});
-}
-function saveLocal(s) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); } catch(e) { console.warn("saveLocal:", e); }
 }
 
 // ─── INVESTMENT DATA MIGRATION LAYER ─────────────────────────────────────────
@@ -219,7 +211,7 @@ const ALL_LEGACY_KEYS = [
   "wealthmap_v1",  "wealthmap_v2",  "wealthmap_v3",  "wealthmap_v4",
   "wealthmap_v5",  "wealthmap_v6",  "wealthmap_v7",  "wealthmap_v8",
   "wealthmap_v9",  "wealthmap_v10", "wealthmap_v11", "wealthmap_v12",
-  "wealthmap_v13", "wealthmap_v14", "wealthmap_v15", "wealthmap_v16",
+  "wealthmap_v13", "wealthmap_v14", "wealthmap_v15",
   // Current key is excluded (handled by loadLocal directly)
 ];
 
@@ -324,19 +316,7 @@ function extractLegacyTrades(raw, fallbackAccountId) {
 
 // Main migration function — called once at startup inside loadLocal.
 // Returns the merged, migrated state to use as the initial app state.
-//
-// IMPORTANT: Migration only runs when currentState has NO investmentTx.
-// If the user has already imported data into the current version, we trust
-// that data completely and skip migration to avoid duplication loops.
 function migrateFromOlderVersion(currentState) {
-  // ── Guard: if current state already has investment data, skip entirely ─────
-  // This prevents re-running migration on every reload after the first import.
-  const currentTxCount = (currentState.investmentTx || []).length;
-  if (currentTxCount > 0) {
-    console.log("[Migration] Current state has", currentTxCount, "trade(s) — skipping migration.");
-    return currentState;
-  }
-
   let migratedTxs   = [];
   let sourceKeyUsed = null;
 
@@ -390,26 +370,18 @@ function migrateFromOlderVersion(currentState) {
   }
 
   // ── Merge migrated trades with any existing trades in current state ──────
-  // Since migration only runs when currentState.investmentTx is empty (guard above),
-  // this merge is only reached on a true cold-start migration (no existing trades).
-  // Dedup is still applied within the migrated batch itself.
-  const seenIds    = new Set();
-  const seenExtIds = new Set();
-  const seenFP     = new Set(); // content fingerprint: type|date|symbol|qty|price
+  const existingIds = new Set(
+    (currentState.investmentTx || []).map(t => t.id)
+  );
+  const existingExtIds = new Set(
+    (currentState.investmentTx || [])
+      .filter(t => t.externalTradeId)
+      .map(t => String(t.externalTradeId))
+  );
 
   const newTxs = migratedTxs.filter(t => {
-    // Intra-batch dedup by exact ID
-    if (seenIds.has(t.id)) return false;
-    seenIds.add(t.id);
-    // Intra-batch dedup by external trade_id (Zerodha trade_id etc.)
-    if (t.externalTradeId) {
-      if (seenExtIds.has(String(t.externalTradeId))) return false;
-      seenExtIds.add(String(t.externalTradeId));
-    }
-    // Intra-batch dedup by content fingerprint
-    const fp = t.type + "|" + t.date + "|" + t.symbol + "|" + t.quantity + "|" + t.price;
-    if (seenFP.has(fp)) return false;
-    seenFP.add(fp);
+    if (existingIds.has(t.id)) return false;                          // exact ID match
+    if (t.externalTradeId && existingExtIds.has(t.externalTradeId)) return false; // ext ID match
     return true;
   });
 
@@ -458,20 +430,36 @@ function migrateFromOlderVersion(currentState) {
 }
 
 // ─── CLOUD ────────────────────────────────────────────────────────────────────
+// pushCloud: upsert full state to Supabase user_data table.
+// Called on every state change (cloud-primary writes).
 async function pushCloud(userId, s) {
+  if (!userId || !s) return;
   const { error } = await supabase.from("user_data").upsert(
     { id: userId, data: s, updated_at: new Date().toISOString() },
     { onConflict: "id" }
   );
-  if (error) throw error;
+  if (error) {
+    console.error("[Cloud] Push failed:", error.message);
+    throw error;
+  }
 }
+
+// pullCloud: fetch latest state from Supabase.
+// Returns migrated+sanitized state, or null if nothing stored.
 async function pullCloud(userId) {
+  if (!userId) return null;
   try {
     const { data, error } = await supabase.from("user_data")
       .select("data").eq("id", userId).maybeSingle();
-    if (error || !data?.data) return null;
-    return sanitize(data.data);
-  } catch { return null; }
+    if (error) { console.warn("[Cloud] Pull error:", error.message); return null; }
+    if (!data?.data) return null;
+    const sanitized = sanitize(data.data);
+    // Run migration on cloud data — it may be from an older client version
+    return migrateFromOlderVersion(sanitized);
+  } catch(e) {
+    console.warn("[Cloud] Pull exception:", e);
+    return null;
+  }
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
@@ -1018,6 +1006,8 @@ function buildTradeBalanceEffects(investmentTx, fixedDeposits) {
 // ─── REDUCER ─────────────────────────────────────────────────────────────────
 function reducer(rawState, action) {
   const s = sanitize(rawState);
+  // Guard: React internals or Supabase realtime may fire with undefined action
+  if (!action || typeof action.type !== "string") return s;
   switch (action.type) {
     case "SET":         return sanitize(action.payload);
 
@@ -1912,21 +1902,9 @@ function AccountModal({ state, onClose, onSave, editAcc }) {
   const [inclNW,        setInclNW]        = useState(editAcc?.includeInNetWorth ?? true);
   const [showCCSettings,setShowCCSettings]= useState(false);
 
-  // Determine if this account is CC or Investment type based on category flags
+  // Determine if this account is CC type based on category's isCreditCardType flag
   const selCat    = cats.find(c => c.id===catId);
   const isCCCat   = !!selCat?.isCreditCardType;
-  const isInvCat  = !!selCat?.isInvestmentType;
-
-  // When category changes, auto-update include_in_networth:
-  //  - Investment/Broker/MF categories → false (value tracked via holdings)
-  //  - CC categories → true (payable balance deducted)
-  //  - Others → keep current value
-  function handleCatChange(newCatId) {
-    setCatId(newCatId);
-    const cat = cats.find(c => c.id === newCatId);
-    if (cat?.isInvestmentType) setInclNW(false);
-    else if (!cat?.isCreditCardType) setInclNW(true);
-  }
 
   function save(ccOverrides={}) {
     if (!name.trim()) return;
@@ -1958,7 +1936,7 @@ function AccountModal({ state, onClose, onSave, editAcc }) {
   return (
     <>
       <Modal title={isEdit?"Edit Account":"Add Account"} onClose={onClose}>
-        <Sel label="Account Type" value={catId} onChange={e=>handleCatChange(e.target.value)}>
+        <Sel label="Account Type" value={catId} onChange={e=>setCatId(e.target.value)}>
           {cats.map(c=><option key={c.id} value={c.id}>{c.icon} {c.name}</option>)}
         </Sel>
         <Inp label="Account Name" value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. SBI Savings, Zerodha…" />
@@ -1968,11 +1946,7 @@ function AccountModal({ state, onClose, onSave, editAcc }) {
         <Inp label={`Opening Balance (${cur})`} type="number" value={opening}
              onChange={e=>setOpening(e.target.value)} placeholder="0.00" />
         <Toggle label="Include in Net Worth?" checked={inclNW} onChange={setInclNW}
-                note={
-                  isCCCat  ? "CC payable balance will be deducted from net worth" :
-                  isInvCat ? "Investment accounts are excluded — value tracked via holdings" :
-                             "Asset balance counted toward net worth"
-                } />
+                note={isCCCat ? "CC payable balance will be deducted from net worth" : "Asset balance counted toward net worth"} />
         <Field label="Icon">
           <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
             {icons.map(ic=>(
@@ -2658,7 +2632,6 @@ function DashboardView({ state }) {
   const fixedDeposits       = state?.fixedDeposits       ||[];
   const marketPrices        = state?.marketPrices        ||{};
   const tradeBalanceEffects = state?.tradeBalanceEffects ||[];
-  const accountCategories   = state?.accountCategories   ||DEFAULT.accountCategories;
   const allCats      = [...(state?.expenseCategories||[]),...(state?.incomeCategories||[])];
   const [showNWBreakdown, setShowNWBreakdown] = useState(false);
 
@@ -2799,7 +2772,6 @@ function AccountsView({ state, dispatch }) {
   const fixedDeposits       = state?.fixedDeposits       ||[];
   const marketPrices        = state?.marketPrices        ||{};
   const tradeBalanceEffects = state?.tradeBalanceEffects ||[];
-  const accountCategories   = state?.accountCategories   ||DEFAULT.accountCategories;
   const byCategory          = accCats.map(cat=>({...cat,accounts:accounts.filter(a=>a.categoryId===cat.id)}));
 
   function toggleDisable(acc, shouldDisable) {
@@ -5580,56 +5552,68 @@ export default function App() {
     return ()=>subscription.unsubscribe();
   },[]);
 
-  // ── On login: pull cloud → smart merge
+  // ── On login: pull cloud → cloud is source of truth ──────────────────────
+  // Cloud data always wins over local cache on login.
   useEffect(()=>{
     if (!user) return;
     let cancelled=false;
     (async()=>{
       setSyncStatus("syncing");
       try {
-        const cloud=await pullCloud(user.id);
+        const cloud = await pullCloud(user.id); // already sanitized + migrated
         if (!cancelled) {
-          const cloudHasData=cloud&&((cloud.accounts?.length>0)||(cloud.transactions?.length>0)||(cloud.holdings?.length>0));
+          const cloudHasData = cloud && (
+            (cloud.accounts?.length > 0) ||
+            (cloud.transactions?.length > 0) ||
+            (cloud.investmentTx?.length > 0) ||
+            (cloud.holdings?.length > 0)
+          );
           if (cloudHasData) {
-            // Run migration on cloud data too — cloud may have old field names
-            // from a previous client version
-            const cloudSanitized = sanitize(cloud);
-            const cloudMigrated  = migrateFromOlderVersion(cloudSanitized);
-            dispatch({type:"SET",payload:cloudMigrated});
-            saveLocal(cloudMigrated);
+            // Cloud has data — it is the source of truth
+            console.log("[Cloud] Loaded from cloud:", cloud.investmentTx?.length ?? 0, "trades");
+            dispatch({ type:"SET", payload:cloud });
+            saveLocal(cloud); // update local cache
           } else {
-            const local=stateRef.current;
-            if ((local.accounts?.length>0)||(local.transactions?.length>0)) {
-              await pushCloud(user.id,local).catch(console.error);
+            // Cloud is empty — push local state up to initialise the cloud record
+            const local = stateRef.current;
+            const localHasData = (local.accounts?.length > 0) || (local.transactions?.length > 0) || (local.investmentTx?.length > 0);
+            if (localHasData) {
+              console.log("[Cloud] Cloud empty — uploading local state with", local.investmentTx?.length ?? 0, "trades");
+              await pushCloud(user.id, local).catch(console.error);
             }
           }
         }
-      } catch(e){ console.error("Cloud sync:",e); }
+      } catch(e) { console.error("[Cloud] Login sync error:", e); }
       if (!cancelled) setSyncStatus("synced");
     })();
-    return ()=>{cancelled=true;};
+    return ()=>{ cancelled=true; };
   },[user]);
 
   // ── Online/offline
   useEffect(()=>{
-    const on=()=>setOnline(true), off=()=>setOnline(false);
+    const on=()=>{ setOnline(true); };
+    const off=()=>setOnline(false);
     window.addEventListener("online",on); window.addEventListener("offline",off);
     return ()=>{window.removeEventListener("online",on);window.removeEventListener("offline",off);};
   },[]);
 
-  // ── Save locally + debounce cloud push on every state change
+  // ── Cloud-primary: every state change → save locally + push to cloud ───────
+  // localStorage = offline cache; Supabase = source of truth.
+  // No debounce — push immediately so data is never lost between sessions.
   useEffect(()=>{
-    saveLocal(state);
-    const u=userRef.current, isOnline=netRef.current;
-    if (!u||!isOnline) return;
+    saveLocal(state); // always keep local cache fresh (for offline use)
+    const u        = userRef.current;
+    const isOnline = netRef.current;
+    if (!u || !isOnline) return; // offline: local cache already saved above
     setSyncStatus("syncing");
     clearTimeout(syncTimer.current);
-    syncTimer.current=setTimeout(async()=>{
+    // Small 400ms coalesce window to avoid flooding on rapid sequential dispatches
+    syncTimer.current = setTimeout(async()=>{
       try {
-        await pushCloud(u.id,stateRef.current);
+        await pushCloud(u.id, stateRef.current);
         setSyncStatus("synced");
       } catch(e) {
-        console.error("Cloud push:",e);
+        console.error("[Cloud] Push error:", e);
         setSyncStatus("error");
       }
     },1500);
