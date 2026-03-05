@@ -1,10 +1,11 @@
 // ============================================================
-// WEALTHMAP v13 — Zerodha Tradebook V2 Import Template
-// Changes vs v12:
-//  1.  ZERODHA_TRADEBOOK_V2 import template added
-//  2.  External trade_id dedup for broker CSV imports
-//  3.  Import result summary (processed / imported / skipped / errors)
-//  4.  Broker format auto-detection from column headers
+// WEALTHMAP v14 — Import Account Selection + Persistence Fix
+// Changes vs v13:
+//  1.  Account selection (Source + Investment) shown before import for trade/broker types
+//  2.  BULK_IMPORT_INVESTMENTS reducer — single atomic dispatch for whole CSV batch
+//  3.  Imported trades use selected accounts for correct balance effects (BUY/SELL)
+//  4.  Persistence: one dispatch replaces per-row loop — no stale state, survives refresh
+//  5.  Import result summary unchanged; works for all import types
 // Changes vs v11:
 //  1.  FD Close: Undo support (FD marked closed, not deleted)
 //  2.  Profits tab: summary per stock only (no individual trade rows)
@@ -21,7 +22,7 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = "https://hqkqhgrfcwixqoehjfaj.supabase.co";
 const SUPABASE_KEY = "sb_publishable_N-ZcUkVL6fF-pch1sZPg6Q_hbd8sUPv";
 const supabase     = createClient(SUPABASE_URL, SUPABASE_KEY);
-const STORAGE_KEY  = "wealthmap_v13";
+const STORAGE_KEY  = "wealthmap_v14";
 
 // ─── CURRENCIES ───────────────────────────────────────────────────────────────
 const CURRENCIES = [
@@ -1035,6 +1036,31 @@ function reducer(rawState, action) {
       const stockEffects = buildTradeBalanceEffects(newTxs, []);
       const fdEffects = s.tradeBalanceEffects.filter(e => e.isFD);
       return { ...s, investmentTx: newTxs, holdings: rebuilt, tradeBalanceEffects: [...stockEffects, ...fdEffects] };
+    }
+
+    // BULK_IMPORT_INVESTMENTS: atomically append many trades from a CSV import.
+    // payload: { trades: itx[] }
+    // Each itx must have accountId (investment) and sourceAccountId (bank).
+    // Uses rebuildHoldings + buildTradeBalanceEffects — identical to delete/edit.
+    // Single dispatch = single saveLocal = no stale-state or persistence issues.
+    case "BULK_IMPORT_INVESTMENTS": {
+      const { trades } = action.payload || {};
+      if (!trades || trades.length === 0) return s;
+      // Merge new trades with existing, preserving order by date
+      const allTxs = [...s.investmentTx, ...trades].sort(
+        (a, b) => new Date(a.date) - new Date(b.date)
+      );
+      // Rebuild holdings from scratch so FIFO is correct across old + new trades
+      const { holdings: rebuilt } = rebuildHoldings(allTxs, []);
+      // Rebuild all trade balance effects (stock effects only; FD effects preserved)
+      const fdEffects    = s.tradeBalanceEffects.filter(e => e.isFD);
+      const stockEffects = buildTradeBalanceEffects(allTxs, []);
+      return {
+        ...s,
+        investmentTx:        allTxs,
+        holdings:            rebuilt,
+        tradeBalanceEffects: [...stockEffects, ...fdEffects],
+      };
     }
 
     // ── Fixed Deposits ────────────────────────────────────────────────────────
@@ -3387,7 +3413,35 @@ function ImportModal({ state, dispatch, onClose }) {
   const [fileName,     setFileName]     = useState("");
   const [loading,      setLoading]      = useState(false);
   const [importResult, setImportResult] = useState(null); // { total, imported, skipped, errors } after import
+
+  // ── Account selection for trade / broker imports ──────────────────────────
+  // Set to the first plausible account when a file is loaded; user can override.
+  const [selInvAccId, setSelInvAccId]  = useState(""); // investment account (e.g. Zerodha)
+  const [selSrcAccId, setSelSrcAccId]  = useState(""); // source / bank account
+
+  // Derive account lists once
+  const allAccounts    = state?.accounts || [];
+  const accTypes       = state?.accountCategories || DEFAULT.accountCategories;
+  const investType     = accTypes.find(t => t.isInvestmentType);
+  const investAccounts = investType
+    ? allAccounts.filter(a => a.categoryId === investType.id && !a.disabled)
+    : [];
+  const bankAccounts   = allAccounts.filter(a =>
+    !a.disabled && (!investType || a.categoryId !== investType.id)
+  );
+
   const fileRef = useRef(null);
+
+  // Whether this import type needs account selection
+  const needsAccounts = (t) => t === "trade" || (TEMPLATES[t] && TEMPLATES[t].brokerFormat);
+
+  // When import type changes, reset account selectors to best defaults
+  function resetAccSelectors(type) {
+    const inv = investAccounts[0]?.id || allAccounts[0]?.id || "";
+    const src = bankAccounts[0]?.id   || allAccounts[0]?.id || "";
+    setSelInvAccId(inv);
+    setSelSrcAccId(src);
+  }
 
   // ── IMPORT TEMPLATE REGISTRY ─────────────────────────────────────────────
   // Standard templates: expense, income, trade (WealthMap native format)
@@ -3475,6 +3529,7 @@ function ImportModal({ state, dispatch, onClose }) {
   async function handleFile(file) {
     if (!file) return;
     setFileName(file.name); setLoading(true); setRows([]); setErrors([]); setImportResult(null);
+    resetAccSelectors(importType);
     try {
       let csvText = "";
       if (file.name.endsWith(".csv") || file.name.endsWith(".txt")) {
@@ -3602,168 +3657,174 @@ function ImportModal({ state, dispatch, onClose }) {
   }
 
   function doImport() {
-    const accounts   = state?.accounts||[];
-    const expCats    = state?.expenseCategories||DEFAULT.expenseCategories;
-    const incCats    = state?.incomeCategories ||DEFAULT.incomeCategories;
-    const accTypes   = state?.accountCategories||DEFAULT.accountCategories;
-    const investType = accTypes.find(t=>t.isInvestmentType);
+    // ── Validate account selection for trade / broker imports ───────────────
+    if (needsAccounts(importType)) {
+      if (!selInvAccId) { toast("Please select an Investment Account before importing", "error"); return; }
+      if (!selSrcAccId) { toast("Please select a Source Account before importing",      "error"); return; }
+    }
+
+    const expCats  = state?.expenseCategories || DEFAULT.expenseCategories;
+    const incCats  = state?.incomeCategories  || DEFAULT.incomeCategories;
     let imported=0, skipped=0, errCount=0;
     const total = rows.length;
 
-    // ── Dedup: fingerprints for native format ────────────────────────────────
-    const existingTxFingerprints = new Set(
+    // ── Dedup sets ───────────────────────────────────────────────────────────
+    const existingTxFP = new Set(
       (state?.transactions||[]).map(t =>
         t.type+"|"+t.date+"|"+t.amount+"|"+t.accountId+"|"+t.categoryId
       )
     );
-    const existingTradeFingerprints = new Set(
+    const existingTradeFP = new Set(
       (state?.investmentTx||[]).map(t =>
         t.type+"|"+t.date+"|"+(t.symbol||"").toUpperCase()+"|"+t.quantity+"|"+t.price+"|"+t.accountId
       )
     );
-    // ── Dedup: external trade IDs for broker formats ─────────────────────────
-    const existingExternalIds = new Set(
+    const existingExtIds = new Set(
       (state?.investmentTx||[])
         .filter(t => t.externalTradeId)
         .map(t => String(t.externalTradeId))
     );
 
+    // ── Collect all valid trade objects (broker + native trade) ─────────────
+    // These will be dispatched in ONE atomic action.
+    const tradesToImport = [];
+
     rows.forEach(row => {
 
-      // ════════════════════════════════════════════════════════════════════
-      // BROKER FORMAT: zerodha_v2 (and any future broker templates)
-      // ════════════════════════════════════════════════════════════════════
+      // ══════════════════════════════════════════════════════════════════════
+      // BROKER FORMAT (e.g. zerodha_v2)
+      // ══════════════════════════════════════════════════════════════════════
       if (row._brokerType && TEMPLATES[row._brokerType]?.brokerFormat) {
         try {
-          const sym        = (row.stock_name || "").toUpperCase().trim();
-          const tradeType  = (row.trade_type || "").toLowerCase().trim();   // buy | sell
-          const qty        = parseFloat(row.quantity);
-          const price      = parseFloat(row.price);
-          const tradeDate  = row.trade_date || "";     // YYYY-MM-DD (Zerodha format)
-          const extId      = row._externalId || "";    // trade_id from CSV
+          const sym       = (row.stock_name || "").toUpperCase().trim();
+          const tradeType = (row.trade_type || "").toLowerCase().trim();
+          const qty       = parseFloat(row.quantity);
+          const price     = parseFloat(row.price);
+          const tradeDate = row.trade_date || "";
+          const extId     = row._externalId || "";
 
-          // Skip if any required field is missing/invalid
           if (!sym || !tradeDate || isNaN(qty) || isNaN(price) || !["buy","sell"].includes(tradeType)) {
             errCount++; return;
           }
+          // Dedup by external trade_id
+          if (extId && existingExtIds.has(extId)) { skipped++; return; }
 
-          // ── Dedup by external trade_id ─────────────────────────────────
-          if (extId && existingExternalIds.has(extId)) { skipped++; return; }
-
-          // ── Resolve investment account (first investment-type account, else first account) ──
-          const invAcc = investType
-            ? accounts.find(a => a.categoryId === investType.id && !a.disabled)
-            : null;
-          const invAccId = invAcc?.id || accounts[0]?.id || "";
+          // Resolve currency from selected investment account
+          const invAcc = allAccounts.find(a => a.id === selInvAccId);
           const currency = invAcc?.currency || "INR";
 
-          // ── Build trade object ─────────────────────────────────────────
-          const holdingId = uid();
           const itx = {
             id:              uid(),
-            holdingId,
-            type:            tradeType,           // "buy" | "sell"
+            holdingId:       uid(),   // used to match holding during rebuild
+            type:            tradeType,
             invType:         "stock",
             symbol:          sym,
-            name:            sym,                 // name = symbol; user can rename later
+            name:            sym,
             quantity:        qty,
             price,
             currency,
-            date:            tradeDate,           // YYYY-MM-DD — system date format
-            accountId:       invAccId,
-            sourceAccountId: "",                  // not in Zerodha tradebook; user can link later
+            date:            tradeDate,
+            accountId:       selInvAccId,     // investment account (user-selected)
+            sourceAccountId: selSrcAccId,     // bank / source account (user-selected)
             brokerage:       0,
             note:            row.exchange ? "Exchange: " + row.exchange : "",
-            externalTradeId: extId,               // store for future dedup
+            externalTradeId: extId,
           };
 
-          const newHolding = tradeType === "buy" ? {
-            id:             holdingId,
-            symbol:         sym,
-            name:           sym,
-            type:           "stock",
-            accountId:      invAccId,
-            currency,
-            lots:           [],
-            quantity:       0,
-            units:          0,
-            avgPrice:       0,
-            investedAmount: 0,
-          } : null;
-
-          dispatch({ type:"ADD_INVESTMENT", payload:{ itx, newHolding, isFD:false } });
-
-          // Track to prevent intra-batch duplicate external IDs
-          if (extId) existingExternalIds.add(extId);
+          tradesToImport.push(itx);
+          if (extId) existingExtIds.add(extId);   // intra-batch dedup
           imported++;
 
         } catch(e) {
           console.warn("Broker import row error:", e);
           errCount++;
         }
-        return; // done with this broker row
+        return;
       }
 
-      // ════════════════════════════════════════════════════════════════════
-      // STANDARD (native) FORMAT: expense, income, trade
-      // ════════════════════════════════════════════════════════════════════
-      try {
-        if (importType==="expense"||importType==="income") {
-          const cats   = importType==="expense" ? expCats : incCats;
-          const catObj = cats.find(c=>c.name.toLowerCase()===row.category?.toLowerCase());
-          const acc    = accounts.find(a=>a.name.toLowerCase()===row.account?.toLowerCase());
+      // ══════════════════════════════════════════════════════════════════════
+      // STANDARD FORMAT: expense, income
+      // ══════════════════════════════════════════════════════════════════════
+      if (importType === "expense" || importType === "income") {
+        try {
+          const cats   = importType === "expense" ? expCats : incCats;
+          const catObj = cats.find(c => c.name.toLowerCase() === row.category?.toLowerCase());
+          const acc    = allAccounts.find(a => a.name.toLowerCase() === row.account?.toLowerCase());
           const fp     = importType+"|"+row.date+"|"+(parseFloat(row.amount)||0)+"|"+(acc?.id||"")+"|"+(catObj?.id||"");
-          if (existingTxFingerprints.has(fp)) { skipped++; return; }
+          if (existingTxFP.has(fp)) { skipped++; return; }
           const tx = {
-            id: uid(), type: importType,
-            amount:     parseFloat(row.amount)||0,
-            currency:   acc?.currency||"INR",
-            categoryId: catObj?.id||cats[0]?.id||"",
-            accountId:  acc?.id||accounts[0]?.id||"",
-            note:       row.note||"",
+            id:         uid(),
+            type:       importType,
+            amount:     parseFloat(row.amount) || 0,
+            currency:   acc?.currency || "INR",
+            categoryId: catObj?.id || cats[0]?.id || "",
+            accountId:  acc?.id    || allAccounts[0]?.id || "",
+            note:       row.note || "",
             date:       row.date,
             tags:       [],
             isRefunded: false, refundedAmount: 0,
           };
-          dispatch({type:"ADD_TX",payload:tx});
-          existingTxFingerprints.add(fp);
+          dispatch({ type:"ADD_TX", payload:tx });
+          existingTxFP.add(fp);
           imported++;
-
-        } else if (importType==="trade") {
-          const invAcc    = accounts.find(a=>a.name.toLowerCase()===(row.investmentaccount||"").toLowerCase());
-          const srcAcc    = accounts.find(a=>a.name.toLowerCase()===(row.sourceaccount||"").toLowerCase());
-          const sym       = (row.symbol||"").toUpperCase();
-          const tradeType = row.type?.toLowerCase()||"buy";
-          const qty       = parseFloat(row.quantity)||0;
-          const price     = parseFloat(row.price)||0;
-          const fp        = tradeType+"|"+row.date+"|"+sym+"|"+qty+"|"+price+"|"+(invAcc?.id||"");
-          if (existingTradeFingerprints.has(fp)) { skipped++; return; }
-          const holdingId = uid();
-          const itx = {
-            id:uid(), holdingId, type: tradeType,
-            invType:"stock", symbol:sym, name:sym,
-            quantity: qty, price, currency: invAcc?.currency||"INR",
-            date: row.date,
-            accountId:      invAcc?.id||accounts[0]?.id||"",
-            sourceAccountId: srcAcc?.id||"",
-            brokerage:0, note: row.note||"",
-          };
-          const newHolding = tradeType==="buy" ? {
-            id:holdingId,symbol:sym,name:sym,type:"stock",
-            accountId:itx.accountId,currency:itx.currency,
-            lots:[],quantity:0,units:0,avgPrice:0,investedAmount:0,
-          } : null;
-          dispatch({type:"ADD_INVESTMENT",payload:{itx,newHolding,isFD:false}});
-          existingTradeFingerprints.add(fp);
-          imported++;
+        } catch(e) {
+          console.warn("Import tx error:", e);
+          errCount++;
         }
-      } catch(e) {
-        console.warn("Import row error:", e);
-        errCount++;
+        return;
+      }
+
+      // ══════════════════════════════════════════════════════════════════════
+      // STANDARD FORMAT: native trade (Date/Symbol/Type/Qty/Price/…)
+      // Uses user-selected accounts (selInvAccId / selSrcAccId)
+      // ══════════════════════════════════════════════════════════════════════
+      if (importType === "trade") {
+        try {
+          const sym       = (row.symbol || "").toUpperCase();
+          const tradeType = (row.type || "buy").toLowerCase();
+          const qty       = parseFloat(row.quantity) || 0;
+          const price     = parseFloat(row.price)    || 0;
+          const fp        = tradeType+"|"+row.date+"|"+sym+"|"+qty+"|"+price+"|"+selInvAccId;
+          if (existingTradeFP.has(fp)) { skipped++; return; }
+
+          const invAcc   = allAccounts.find(a => a.id === selInvAccId);
+          const currency = invAcc?.currency || "INR";
+
+          const itx = {
+            id:              uid(),
+            holdingId:       uid(),
+            type:            tradeType,
+            invType:         "stock",
+            symbol:          sym,
+            name:            sym,
+            quantity:        qty,
+            price,
+            currency,
+            date:            row.date,
+            accountId:       selInvAccId,
+            sourceAccountId: selSrcAccId,
+            brokerage:       0,
+            note:            row.note || "",
+          };
+
+          tradesToImport.push(itx);
+          existingTradeFP.add(fp);
+          imported++;
+        } catch(e) {
+          console.warn("Import trade error:", e);
+          errCount++;
+        }
       }
     });
 
-    // ── Show result summary (don't auto-close so user can see it) ───────────
+    // ── Dispatch all trades in one atomic action ──────────────────────────
+    // This rebuilds holdings + balance effects in one go and triggers a
+    // single saveLocal call → data survives refresh and screen changes.
+    if (tradesToImport.length > 0) {
+      dispatch({ type:"BULK_IMPORT_INVESTMENTS", payload:{ trades: tradesToImport } });
+    }
+
+    // ── Result summary ────────────────────────────────────────────────────
     setImportResult({ total, imported, skipped, errors: errCount });
     const parts = [
       imported + " trade(s) imported",
@@ -3778,13 +3839,13 @@ function ImportModal({ state, dispatch, onClose }) {
       {/* Type selector */}
       <div style={{display:"flex",gap:6,marginBottom:16,overflowX:"auto",paddingBottom:2}}>
         {[["expense","📤 Expenses"],["income","📥 Income"],["trade","📊 Trades"]].map(([v,l])=>(
-          <button key={v} onClick={()=>{setImportType(v);setRows([]);setErrors([]);setFileName("");setImportResult(null);}}
+          <button key={v} onClick={()=>{setImportType(v);setRows([]);setErrors([]);setFileName("");setImportResult(null);resetAccSelectors(v);}}
             style={{flexShrink:0,padding:"7px 14px",borderRadius:18,border:`2px solid ${importType===v?"#6366F1":"#E2E8F0"}`,background:importType===v?"#EEF2FF":"#fff",color:importType===v?"#6366F1":"#64748B",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>{l}</button>
         ))}
         {/* Broker format templates */}
         <div style={{width:"1px",background:"#E2E8F0",flexShrink:0,margin:"0 2px"}} />
         {[["zerodha_v2","🟠 Zerodha"]].map(([v,l])=>(
-          <button key={v} onClick={()=>{setImportType(v);setRows([]);setErrors([]);setFileName("");setImportResult(null);}}
+          <button key={v} onClick={()=>{setImportType(v);setRows([]);setErrors([]);setFileName("");setImportResult(null);resetAccSelectors(v);}}
             style={{flexShrink:0,padding:"7px 14px",borderRadius:18,border:`2px solid ${importType===v?"#F59E0B":"#E2E8F0"}`,background:importType===v?"#FFFBEB":"#fff",color:importType===v?"#92400E":"#64748B",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>{l}</button>
         ))}
       </div>
@@ -3837,6 +3898,59 @@ function ImportModal({ state, dispatch, onClose }) {
         style={{width:"100%",padding:"12px",borderRadius:10,border:"2px dashed #C7D2FE",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600,fontSize:14,marginBottom:12}}>
         {loading?"⏳ Reading…":fileName?`📄 ${fileName}`:"📂 Click to Upload CSV / XLSX"}
       </button>
+
+      {/* ── Account Selection — shown for trade & broker imports once file is loaded ── */}
+      {needsAccounts(importType) && rows.length > 0 && errors.length === 0 && !importResult && (
+        <div style={{background:"#F0F9FF",border:"1.5px solid #BAE6FD",borderRadius:10,padding:14,marginBottom:14}}>
+          <div style={{fontWeight:700,fontSize:13,color:"#0369A1",marginBottom:10}}>
+            🏦 Assign Accounts for Imported Trades
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            {/* Investment Account */}
+            <div>
+              <label style={{display:"block",fontSize:12,fontWeight:600,color:"#374151",marginBottom:4}}>
+                Investment Account <span style={{color:"#EF4444"}}>*</span>
+              </label>
+              <select
+                value={selInvAccId}
+                onChange={e => setSelInvAccId(e.target.value)}
+                style={{width:"100%",padding:"8px 10px",borderRadius:8,border:"1.5px solid #BAE6FD",fontSize:13,fontFamily:"inherit",background:"#fff",color:"#0F172A"}}
+              >
+                <option value="">— select —</option>
+                {allAccounts.filter(a=>!a.disabled).map(a => (
+                  <option key={a.id} value={a.id}>{a.name}</option>
+                ))}
+              </select>
+              <div style={{fontSize:11,color:"#64748B",marginTop:3}}>
+                e.g. Zerodha, Groww — holdings go here
+              </div>
+            </div>
+            {/* Source / Bank Account */}
+            <div>
+              <label style={{display:"block",fontSize:12,fontWeight:600,color:"#374151",marginBottom:4}}>
+                Source Account <span style={{color:"#EF4444"}}>*</span>
+              </label>
+              <select
+                value={selSrcAccId}
+                onChange={e => setSelSrcAccId(e.target.value)}
+                style={{width:"100%",padding:"8px 10px",borderRadius:8,border:"1.5px solid #BAE6FD",fontSize:13,fontFamily:"inherit",background:"#fff",color:"#0F172A"}}
+              >
+                <option value="">— select —</option>
+                {allAccounts.filter(a=>!a.disabled).map(a => (
+                  <option key={a.id} value={a.id}>{a.name}</option>
+                ))}
+              </select>
+              <div style={{fontSize:11,color:"#64748B",marginTop:3}}>
+                e.g. Bank account used to fund purchases
+              </div>
+            </div>
+          </div>
+          <div style={{marginTop:10,padding:"8px 10px",background:"#E0F2FE",borderRadius:7,fontSize:11,color:"#0369A1",lineHeight:1.6}}>
+            <strong>BUY:</strong> Source ↓ decreases · Investment ↑ increases<br/>
+            <strong>SELL:</strong> Investment ↓ decreases · Source ↑ increases
+          </div>
+        </div>
+      )}
 
       {/* Errors */}
       {errors.length>0&&(
@@ -3941,8 +4055,15 @@ function ImportModal({ state, dispatch, onClose }) {
       <BtnRow>
         <Btn variant="ghost" onClick={onClose}>{importResult ? "Close" : "Cancel"}</Btn>
         {!importResult && (
-          <Btn onClick={doImport} disabled={rows.length===0||errors.length>0}>
-            Import {rows.length>0 ? rows.length+" Records" : ""}
+          <Btn
+            onClick={doImport}
+            disabled={
+              rows.length === 0 ||
+              errors.length > 0 ||
+              (needsAccounts(importType) && (!selInvAccId || !selSrcAccId))
+            }
+          >
+            Import {rows.length > 0 ? rows.length + " Records" : ""}
           </Btn>
         )}
         {importResult && importResult.imported > 0 && (
