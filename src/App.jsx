@@ -1,10 +1,12 @@
 // ============================================================
-// WEALTHMAP v15 — Net Worth Double-Count Fix
-// Changes vs v14:
-//  1.  calcNetWorth now receives accountCategories as 8th parameter
-//  2.  Investment accounts correctly excluded from base balance sum
-//      (was checking acc.isInvestmentType which is a property of *categories*, not accounts)
-//  3.  Holdings value counted once only — no more double-count
+// WEALTHMAP v16 — Investment Data Migration Layer
+// Changes vs v15:
+//  1.  migrateFromOlderVersion() scans wealthmap_v1..v14 + bare keys on every load
+//  2.  Maps all legacy field names → current investmentTx / holdings / tradeBalanceEffects
+//  3.  Runs rebuildHoldings + buildTradeBalanceEffects after migration
+//  4.  Merges migrated trades into existing v15 state (additive — never deletes)
+//  5.  Marks migrated keys with __migrated_to flag so migration runs only once
+//  6.  Full console logging of migration steps
 // Changes vs v11:
 //  1.  FD Close: Undo support (FD marked closed, not deleted)
 //  2.  Profits tab: summary per stock only (no individual trade rows)
@@ -21,7 +23,7 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = "https://hqkqhgrfcwixqoehjfaj.supabase.co";
 const SUPABASE_KEY = "sb_publishable_N-ZcUkVL6fF-pch1sZPg6Q_hbd8sUPv";
 const supabase     = createClient(SUPABASE_URL, SUPABASE_KEY);
-const STORAGE_KEY  = "wealthmap_v15";
+const STORAGE_KEY  = "wealthmap_v16";
 
 // ─── CURRENCIES ───────────────────────────────────────────────────────────────
 const CURRENCIES = [
@@ -149,13 +151,278 @@ function sanitize(raw) {
 // ─── LOCAL STORAGE ────────────────────────────────────────────────────────────
 function loadLocal() {
   try {
+    // 1. Load whatever is already stored under the current key (may be empty/new)
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return sanitize(JSON.parse(raw));
-  } catch(e) { console.warn("loadLocal:", e); }
+    const currentState = raw ? sanitize(JSON.parse(raw)) : sanitize({});
+
+    // 2. Run migration — scans all prior wealthmap_vN keys, merges any
+    //    investment data found there into currentState, rebuilds holdings.
+    //    If nothing to migrate this is a fast no-op.
+    const migratedState = migrateFromOlderVersion(currentState);
+
+    // 3. If migration added data, persist the merged state immediately so
+    //    subsequent loads don't have to migrate again.
+    if (migratedState !== currentState) {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(migratedState));
+        console.log("[Migration] Persisted migrated state to", STORAGE_KEY);
+      } catch (e) {
+        console.warn("[Migration] Could not persist migrated state:", e);
+      }
+    }
+
+    return migratedState;
+  } catch(e) {
+    console.warn("loadLocal:", e);
+  }
   return sanitize({});
 }
 function saveLocal(s) {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); } catch(e) { console.warn("saveLocal:", e); }
+}
+
+// ─── INVESTMENT DATA MIGRATION LAYER ─────────────────────────────────────────
+//
+// Problem: Each version bump changes the STORAGE_KEY (wealthmap_v1 → v16).
+// When the app loads with a new key, the old key's data is ignored, making
+// holdings/trades appear to vanish.
+//
+// Solution: On every cold start, scan all known prior keys, find the most
+// recent one that has investment data, migrate its records into the current
+// state format, rebuild holdings + balance effects, and merge additively into
+// the current key.  The source key is then stamped with __migrated_to so
+// migration runs only once per key.
+//
+// Field mapping (old → new):
+//   investments / portfolio / investmentTransactions / trades → investmentTx
+//   Each record: symbol/stock → symbol, qty/quantity → quantity,
+//                price/rate → price, date/tradeDate/trade_date → date,
+//                type/tradeType/trade_type → type (buy|sell)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// All storage keys ever used by WealthMap (oldest first)
+const ALL_LEGACY_KEYS = [
+  "wealthmap",
+  "wealthmap-v1",
+  "wealthmap_v1",  "wealthmap_v2",  "wealthmap_v3",  "wealthmap_v4",
+  "wealthmap_v5",  "wealthmap_v6",  "wealthmap_v7",  "wealthmap_v8",
+  "wealthmap_v9",  "wealthmap_v10", "wealthmap_v11", "wealthmap_v12",
+  "wealthmap_v13", "wealthmap_v14", "wealthmap_v15",
+  // Current key is excluded (handled by loadLocal directly)
+];
+
+// Normalise one raw trade/investment record from any old schema → current itx shape
+function migrateOneTrade(raw, fallbackAccountId) {
+  if (!raw || typeof raw !== "object") return null;
+
+  // Symbol — various old names
+  const symbol = (
+    raw.symbol || raw.stock || raw.stock_name || raw.ticker || raw.scrip || ""
+  ).toString().toUpperCase().trim();
+  if (!symbol) return null;
+
+  // Quantity
+  const quantity = parseFloat(
+    raw.quantity ?? raw.qty ?? raw.units ?? raw.shares ?? 0
+  );
+  if (isNaN(quantity) || quantity <= 0) return null;
+
+  // Price
+  const price = parseFloat(
+    raw.price ?? raw.rate ?? raw.nav ?? raw.buyPrice ?? raw.tradePrice ?? 0
+  );
+  if (isNaN(price) || price < 0) return null;
+
+  // Date — accept ISO strings, YYYY-MM-DD, or Date objects
+  let date = (
+    raw.date || raw.tradeDate || raw.trade_date ||
+    raw.investedDate || raw.purchaseDate || raw.created_at || ""
+  ).toString().trim();
+  // Try to normalise to YYYY-MM-DD
+  if (date && !/^\d{4}-\d{2}-\d{2}/.test(date)) {
+    const d = new Date(date);
+    if (!isNaN(d)) date = d.toISOString().slice(0, 10);
+  }
+  if (!date) date = new Date().toISOString().slice(0, 10);
+
+  // Trade type — default to "buy" if ambiguous
+  const rawType = (
+    raw.type || raw.tradeType || raw.trade_type || raw.txType || "buy"
+  ).toString().toLowerCase().trim();
+  const type = rawType === "sell" ? "sell" : "buy";
+
+  // Accounts
+  const accountId       = raw.accountId       || raw.investmentAccountId || fallbackAccountId || "";
+  const sourceAccountId = raw.sourceAccountId || raw.bankAccountId       || "";
+
+  // External trade ID (preserve for dedup)
+  const externalTradeId = raw.externalTradeId || raw.trade_id || raw.tradeId || raw.id || "";
+
+  const id = raw.id && typeof raw.id === "string" && raw.id.startsWith("tx_")
+    ? raw.id           // keep existing well-formed IDs
+    : "migrated_" + (externalTradeId || (symbol + "_" + date + "_" + Math.random().toString(36).slice(2, 7)));
+
+  return {
+    id,
+    holdingId:       raw.holdingId || "h_" + symbol + "_" + accountId,
+    type,
+    invType:         raw.invType || raw.investmentType || (raw.assetType === "mf" ? "mf" : "stock"),
+    symbol,
+    name:            raw.name || raw.companyName || raw.stockName || symbol,
+    quantity,
+    price,
+    currency:        raw.currency || "INR",
+    date,
+    accountId,
+    sourceAccountId,
+    brokerage:       parseFloat(raw.brokerage || raw.commission || 0) || 0,
+    note:            raw.note || raw.notes || raw.remarks || "",
+    externalTradeId,
+    _migrated:       true,
+  };
+}
+
+// Extract investment transactions from a raw stored object using all known field names
+function extractLegacyTrades(raw, fallbackAccountId) {
+  const candidates = [];
+
+  // Try every known array field name that could hold trades
+  const fields = [
+    "investmentTx",           // current name (v8+)
+    "investmentTransactions", // older alias
+    "trades",                 // some versions used this
+    "investments",            // early versions
+    "portfolio",              // some experimental versions
+    "stockTrades",
+    "mutualFundTrades",
+    "txHistory",
+  ];
+
+  fields.forEach(f => {
+    if (Array.isArray(raw[f])) {
+      raw[f].forEach(r => {
+        const t = migrateOneTrade(r, fallbackAccountId);
+        if (t) candidates.push(t);
+      });
+    }
+  });
+
+  return candidates;
+}
+
+// Main migration function — called once at startup inside loadLocal.
+// Returns the merged, migrated state to use as the initial app state.
+function migrateFromOlderVersion(currentState) {
+  let migratedTxs   = [];
+  let sourceKeyUsed = null;
+
+  // Scan from newest legacy key to oldest — take the first one with trades
+  const keysToScan = [...ALL_LEGACY_KEYS].reverse();
+
+  for (const key of keysToScan) {
+    if (key === STORAGE_KEY) continue; // never migrate from ourselves
+
+    let raw = null;
+    try {
+      const stored = localStorage.getItem(key);
+      if (!stored) continue;
+      raw = JSON.parse(stored);
+    } catch (e) {
+      console.warn("[Migration] Could not parse key:", key, e);
+      continue;
+    }
+
+    // Skip if already migrated to current version
+    if (raw?.__migrated_to === STORAGE_KEY) {
+      console.log("[Migration] Key already migrated:", key);
+      continue;
+    }
+
+    // Determine the fallback investment account from old state
+    const oldAccounts = Array.isArray(raw?.accounts) ? raw.accounts : [];
+    const oldCats     = Array.isArray(raw?.accountCategories) ? raw.accountCategories : DEFAULT.accountCategories;
+    const invCat      = oldCats.find(c => c.isInvestmentType);
+    const invAcc      = invCat
+      ? oldAccounts.find(a => a.categoryId === invCat.id || a.account_type === invCat.id)
+      : null;
+    const fallbackAccId = invAcc?.id || oldAccounts[0]?.id || "";
+
+    const trades = extractLegacyTrades(raw, fallbackAccId);
+
+    if (trades.length === 0) {
+      console.log("[Migration] No trades found in key:", key, "(skipping)");
+      continue;
+    }
+
+    console.log("[Migration] Found", trades.length, "trade record(s) in key:", key);
+    migratedTxs   = trades;
+    sourceKeyUsed = key;
+    break; // use the most-recent key with data
+  }
+
+  if (migratedTxs.length === 0) {
+    console.log("[Migration] No legacy investment data found — nothing to migrate.");
+    return currentState;
+  }
+
+  // ── Merge migrated trades with any existing trades in current state ──────
+  const existingIds = new Set(
+    (currentState.investmentTx || []).map(t => t.id)
+  );
+  const existingExtIds = new Set(
+    (currentState.investmentTx || [])
+      .filter(t => t.externalTradeId)
+      .map(t => String(t.externalTradeId))
+  );
+
+  const newTxs = migratedTxs.filter(t => {
+    if (existingIds.has(t.id)) return false;                          // exact ID match
+    if (t.externalTradeId && existingExtIds.has(t.externalTradeId)) return false; // ext ID match
+    return true;
+  });
+
+  console.log("[Migration] New (non-duplicate) trades to add:", newTxs.length);
+
+  if (newTxs.length === 0) {
+    console.log("[Migration] All migrated trades already exist — nothing to add.");
+    return currentState;
+  }
+
+  // ── Rebuild holdings + balance effects for the full merged tx list ────────
+  const allTxs = [...(currentState.investmentTx || []), ...newTxs]
+    .sort((a, b) => new Date(a.date) - new Date(b.date));
+
+  console.log("[Migration] Rebuilding holdings from", allTxs.length, "total trades...");
+  const { holdings, realizedTrades } = rebuildHoldings(allTxs, []);
+  console.log("[Migration] Holdings rebuilt:", holdings.length, "open position(s)");
+
+  const fdEffects    = (currentState.tradeBalanceEffects || []).filter(e => e.isFD);
+  const stockEffects = buildTradeBalanceEffects(allTxs, []);
+  console.log("[Migration] Balance effects rebuilt:", stockEffects.length + fdEffects.length, "effect(s)");
+
+  // ── Stamp source key as migrated so we don't run again ───────────────────
+  try {
+    const src = JSON.parse(localStorage.getItem(sourceKeyUsed) || "{}");
+    src.__migrated_to = STORAGE_KEY;
+    localStorage.setItem(sourceKeyUsed, JSON.stringify(src));
+    console.log("[Migration] Stamped source key as migrated:", sourceKeyUsed, "→", STORAGE_KEY);
+  } catch (e) {
+    console.warn("[Migration] Could not stamp source key:", e);
+  }
+
+  const mergedState = {
+    ...currentState,
+    investmentTx:        allTxs,
+    holdings,
+    tradeBalanceEffects: [...stockEffects, ...fdEffects],
+  };
+
+  console.log("[Migration] ✅ Migration complete.",
+    newTxs.length, "trade(s) added,",
+    holdings.length, "holding(s) active."
+  );
+
+  return mergedState;
 }
 
 // ─── CLOUD ────────────────────────────────────────────────────────────────────
@@ -5274,8 +5541,12 @@ export default function App() {
         if (!cancelled) {
           const cloudHasData=cloud&&((cloud.accounts?.length>0)||(cloud.transactions?.length>0)||(cloud.holdings?.length>0));
           if (cloudHasData) {
-            dispatch({type:"SET",payload:cloud});
-            saveLocal(cloud);
+            // Run migration on cloud data too — cloud may have old field names
+            // from a previous client version
+            const cloudSanitized = sanitize(cloud);
+            const cloudMigrated  = migrateFromOlderVersion(cloudSanitized);
+            dispatch({type:"SET",payload:cloudMigrated});
+            saveLocal(cloudMigrated);
           } else {
             const local=stateRef.current;
             if ((local.accounts?.length>0)||(local.transactions?.length>0)) {
