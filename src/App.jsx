@@ -1,11 +1,10 @@
 // ============================================================
-// WEALTHMAP v14 — Import Account Selection + Persistence Fix
-// Changes vs v13:
-//  1.  Account selection (Source + Investment) shown before import for trade/broker types
-//  2.  BULK_IMPORT_INVESTMENTS reducer — single atomic dispatch for whole CSV batch
-//  3.  Imported trades use selected accounts for correct balance effects (BUY/SELL)
-//  4.  Persistence: one dispatch replaces per-row loop — no stale state, survives refresh
-//  5.  Import result summary unchanged; works for all import types
+// WEALTHMAP v15 — Net Worth Double-Count Fix
+// Changes vs v14:
+//  1.  calcNetWorth now receives accountCategories as 8th parameter
+//  2.  Investment accounts correctly excluded from base balance sum
+//      (was checking acc.isInvestmentType which is a property of *categories*, not accounts)
+//  3.  Holdings value counted once only — no more double-count
 // Changes vs v11:
 //  1.  FD Close: Undo support (FD marked closed, not deleted)
 //  2.  Profits tab: summary per stock only (no individual trade rows)
@@ -22,7 +21,7 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = "https://hqkqhgrfcwixqoehjfaj.supabase.co";
 const SUPABASE_KEY = "sb_publishable_N-ZcUkVL6fF-pch1sZPg6Q_hbd8sUPv";
 const supabase     = createClient(SUPABASE_URL, SUPABASE_KEY);
-const STORAGE_KEY  = "wealthmap_v14";
+const STORAGE_KEY  = "wealthmap_v15";
 
 // ─── CURRENCIES ───────────────────────────────────────────────────────────────
 const CURRENCIES = [
@@ -300,54 +299,71 @@ function calcBalance(accountId, transactions, accounts, tradeBalanceEffects) {
 
 // ─── NET WORTH CALCULATOR (CENTRALIZED SERVICE) ───────────────────────────────
 // Single source of truth — all views must use this function.
-// Net Worth = bank + cash + wallet + investment holdings (at market/invested value)
-//           + fixed deposits (at maturity value)
+// Net Worth = bank + cash + wallet + holdings value (invested cost)
+//           + fixed deposits (principal, active only)
 //           − credit card payable balances
-// Investment accounts themselves are NOT added as a balance (they're tracked via holdings).
 //
-// @param accounts           - all accounts (will filter by include_in_networth / includeInNetWorth)
-// @param transactions       - all transactions
-// @param fxRates            - FX rates map
-// @param holdings           - computed holdings array
-// @param fixedDeposits      - FD array
-// @param marketPrices       - { [symbol]: { current_price } }
-// @param tradeBalanceEffects - trade balance deduction/credit effects
-function calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, marketPrices, tradeBalanceEffects) {
-  let assets   = 0;
+// Investment accounts (categoryId maps to a category with isInvestmentType:true)
+// are EXCLUDED from the base account balance sum. Their value is represented
+// entirely by the holdings array — adding both would double-count.
+//
+// @param accounts            - all accounts
+// @param transactions        - all transactions
+// @param fxRates             - FX rates map { "USD": 83.5, ... }
+// @param holdings            - computed holdings (stocks + MFs)
+// @param fixedDeposits       - FD array
+// @param marketPrices        - unused (kept for signature compat)
+// @param tradeBalanceEffects - trade balance effects (buy/sell)
+// @param accountCategories   - account category definitions (needed to detect investment type)
+function calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, marketPrices, tradeBalanceEffects, accountCategories) {
+  let assets    = 0;
   let ccPayable = 0;
-  const mp = marketPrices || {};
   const eff = tradeBalanceEffects || [];
 
+  // Build a set of category IDs that are investment-type
+  // (category objects carry isInvestmentType:true, accounts do NOT)
+  const cats = accountCategories || DEFAULT.accountCategories;
+  const investmentCatIds = new Set(
+    cats.filter(c => c.isInvestmentType).map(c => c.id)
+  );
+
   accounts.forEach(acc => {
-    // Respect both legacy includeInNetWorth and new include_in_networth
-    const inNW = acc.include_in_networth !== undefined ? acc.include_in_networth : acc.includeInNetWorth;
+    // Respect both legacy includeInNetWorth and new include_in_networth flags
+    const inNW = acc.include_in_networth !== undefined
+      ? acc.include_in_networth
+      : acc.includeInNetWorth;
     if (!inNW) return;
-    // Check active status (both legacy `disabled` and new `is_active`)
-    const isActive = acc.is_active !== undefined ? acc.is_active : !acc.disabled;
 
     if (acc.isCreditCard) {
+      // Credit card: subtract outstanding payable from net worth
       const { payable, outstanding } = calcCCBalance(acc, transactions);
-      ccPayable += toINR(payable + outstanding, acc.currency||"INR", fxRates);
-    } else if (acc.isInvestmentType || (acc.accountCategories && acc.accountCategories.find && false)) {
-      // Investment accounts: balance tracked via holdings, not direct balance
-      // Skip — holdings handled separately below
+      ccPayable += toINR(payable + outstanding, acc.currency || "INR", fxRates);
+
+    } else if (investmentCatIds.has(acc.categoryId || acc.account_type)) {
+      // ── Investment account ────────────────────────────────────────────────
+      // Its "value" is represented by the holdings array below.
+      // Do NOT add this account's calcBalance() here — that would double-count.
+      // (The tradeBalanceEffects on this account reflect money moving in/out of
+      //  the account, which equals the holdings invested amount.)
+
     } else {
+      // Bank / cash / wallet / other — add real balance
       const bal = calcBalance(acc.id, transactions, accounts, eff);
-      assets += toINR(bal, acc.currency||"INR", fxRates);
+      assets += toINR(bal, acc.currency || "INR", fxRates);
     }
   });
 
-  // Add investment holdings value (trade prices only — no market price)
-  (holdings||[]).forEach(h => {
+  // ── Holdings value (stocks + mutual funds) ─────────────────────────────
+  // Counted once here. Investment account balances above are skipped.
+  (holdings || []).forEach(h => {
     const qty   = h.quantity || h.units || 0;
     const value = h.investedAmount || qty * (h.avgPrice || h.nav || 0);
-    assets += toINR(value, h.currency||"INR", fxRates);
+    assets += toINR(value, h.currency || "INR", fxRates);
   });
 
-  // Add active (non-closed) fixed deposits at invested amount
-  (fixedDeposits||[]).filter(fd => fd.status !== "closed").forEach(fd => {
-    const principal = parseFloat(fd.amount)||0;
-    assets += toINR(principal, fd.currency||"INR", fxRates);
+  // ── Active fixed deposits at principal ────────────────────────────────
+  (fixedDeposits || []).filter(fd => fd.status !== "closed").forEach(fd => {
+    assets += toINR(parseFloat(fd.amount) || 0, fd.currency || "INR", fxRates);
   });
 
   return assets - ccPayable;
@@ -2249,7 +2265,7 @@ function NetWorthBreakdownModal({ state, onClose }) {
   const tradeBalanceEffects = state?.tradeBalanceEffects ||[];
   const accountCategories   = state?.accountCategories   ||DEFAULT.accountCategories;
 
-  const netWorth = calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, marketPrices, tradeBalanceEffects);
+  const netWorth = calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, marketPrices, tradeBalanceEffects, accountCategories);
 
   // Bank accounts
   const bankCatIds = accountCategories.filter(c=>c.name==="Bank"||c.id==="cat_bank").map(c=>c.id);
@@ -2339,7 +2355,7 @@ function DashboardView({ state }) {
   const monthNetOut   = monthGrossOut - monthRefunded;
 
   // ── Centralized net worth — single source of truth ──────────────────────
-  const netWorth = calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, marketPrices, tradeBalanceEffects);
+  const netWorth = calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, marketPrices, tradeBalanceEffects, accountCategories);
   const recentTx = [...transactions].sort((a,b)=>new Date(b.date)-new Date(a.date)).slice(0,5);
 
   // Portfolio value at market price if available
@@ -2485,7 +2501,7 @@ function AccountsView({ state, dispatch }) {
     toast("Account deleted");
   }
 
-  const netWorth = calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, marketPrices, tradeBalanceEffects);
+  const netWorth = calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, marketPrices, tradeBalanceEffects, accountCategories);
 
   return (
     <div>
