@@ -1,5 +1,5 @@
 // ============================================================
-// WEALTHMAP v17 — Cloud-Primary Storage + Reducer Safety Guard
+// WEALTHMAP v24 — Demerger via virtual investmentTx: holdings always rebuilt from ledger, zero-qty auto-removed
 // Changes vs v16:
 //  1.  Cloud-primary: Supabase is the source of truth, not localStorage
 //  2.  On login: always pull from cloud first; localStorage is only offline cache
@@ -23,7 +23,7 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = "https://hqkqhgrfcwixqoehjfaj.supabase.co";
 const SUPABASE_KEY = "sb_publishable_N-ZcUkVL6fF-pch1sZPg6Q_hbd8sUPv";
 const supabase     = createClient(SUPABASE_URL, SUPABASE_KEY);
-const STORAGE_KEY  = "wealthmap_v17";
+const STORAGE_KEY  = "wealthmap_v24";
 
 // ─── CURRENCIES ───────────────────────────────────────────────────────────────
 const CURRENCIES = [
@@ -148,41 +148,104 @@ function sanitize(raw) {
   };
 }
 
-// ─── STORAGE: CLOUD-PRIMARY ───────────────────────────────────────────────────
+// ─── STORAGE: CLOUD-ONLY ─────────────────────────────────────────────────────
 //
-// Architecture:
-//   • Supabase (cloud) is the single source of truth.
-//   • localStorage is a write-through offline cache ONLY.
-//   • On cold start: load from localStorage (sync/instant) for immediate render,
-//     then replace with cloud data as soon as the user session resolves.
-//   • On every state change: write to localStorage AND push to Supabase.
-//   • When offline: writes queue in localStorage and push when back online.
+// Architecture (v20+):
+//   • Supabase is the ONLY source of truth — no localStorage for data at all.
+//   • App starts with empty state and shows a loading screen.
+//   • On login: pull cloud → dispatch SET → that is the entire state.
+//   • On every state change: push to Supabase only.
+//   • localStorage is NOT used for data (prevents stale/doubled cache issues).
 //
-// This means data is always available across devices and survives app updates.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Write-through local cache (offline fallback only)
-function saveLocal(s) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); } catch(e) { console.warn("saveLocal:", e); }
-}
+// saveLocal: intentional no-op — localStorage disabled to prevent stale data bugs.
+// Kept as a named function so any internal call sites compile without error.
+function saveLocal(_s) { /* cloud-only: localStorage writes disabled */ }
 
-// Cold-start load: read local cache for instant first render.
-// Migration runs here too so old data is recovered before the cloud pull completes.
-function loadLocal() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    const currentState = raw ? sanitize(JSON.parse(raw)) : sanitize({});
-    const migratedState = migrateFromOlderVersion(currentState);
-    if (migratedState !== currentState) {
-      // Persist migration immediately so it doesn't re-run next load
-      saveLocal(migratedState);
-      console.log("[Migration] Persisted migrated state to", STORAGE_KEY);
+// loadLocal: returns empty state — app always waits for cloud on login.
+function loadLocal() { return sanitize({}); }
+
+// ─── DEDUP INVESTMENT TRANSACTIONS ───────────────────────────────────────────
+// Removes trades that were duplicated by earlier migration/import bugs.
+//
+// TWO-TIER DEDUP STRATEGY:
+//
+// Tier 1 — externalTradeId (Zerodha trade_id, broker ID, etc.)
+//   If a trade has an externalTradeId, that is the authoritative unique key.
+//   Two trades with the same externalTradeId are always duplicates regardless
+//   of any other field.
+//
+// Tier 2 — content fingerprint (fallback for manually-entered trades only)
+//   Only applied to trades that have NO externalTradeId.
+//   Key: symbol + date + type + quantity + price + accountId
+//   This is intentionally narrow — only exact matches on ALL six fields
+//   are considered duplicates. A legitimate same-day same-price second buy
+//   of the same stock in the same account is not caught here (correct behaviour:
+//   those are genuinely two separate trades that happen to share fields).
+//   The migration bug produced EXACT copies of every record, so this still
+//   catches all migration-doubled manual trades.
+//
+// After dedup, holdings and tradeBalanceEffects are rebuilt from scratch.
+function deduplicateState(s) {
+  const txs = s.investmentTx || [];
+  if (txs.length === 0) return s;
+
+  const seenExtIds = new Set(); // Tier 1: externalTradeId → seen?
+  const seenFP     = new Set(); // Tier 2: content fingerprint → seen?
+  const unique     = [];
+  let   removed    = 0;
+
+  for (const tx of txs) {
+    const extId = tx.externalTradeId ? String(tx.externalTradeId).trim() : "";
+
+    if (extId) {
+      // ── Tier 1: broker trade ID is the sole dedup key ──────────────────────
+      if (seenExtIds.has(extId)) {
+        removed++;
+        console.log(`[Dedup] Drop duplicate externalTradeId=${extId} (${tx.symbol} ${tx.type} ${tx.date})`);
+        continue;
+      }
+      seenExtIds.add(extId);
+    } else {
+      // ── Tier 2: no broker ID — use exact content fingerprint ───────────────
+      // Only catches trades that are IDENTICAL on all six fields.
+      const fp = [
+        (tx.symbol   || "").toUpperCase(),
+        tx.date      || "",
+        tx.type      || "",
+        String(parseFloat(tx.quantity) || 0),
+        String(parseFloat(tx.price)    || 0),
+        tx.accountId || "",
+      ].join("|");
+
+      if (seenFP.has(fp)) {
+        removed++;
+        console.log(`[Dedup] Drop duplicate fingerprint ${tx.symbol} ${tx.type} ${tx.quantity}@${tx.price} on ${tx.date}`);
+        continue;
+      }
+      seenFP.add(fp);
     }
-    return migratedState;
-  } catch(e) {
-    console.warn("loadLocal:", e);
+
+    unique.push(tx);
   }
-  return sanitize({});
+
+  if (removed === 0) return s; // nothing changed
+
+  console.log(`[Dedup] Removed ${removed} duplicate trade(s). ${unique.length} unique trades remain.`);
+
+  // Rebuild holdings and balance effects from the clean tx list
+  const sorted = [...unique].sort((a, b) => new Date(a.date) - new Date(b.date));
+  const { holdings } = rebuildHoldings(sorted, []);
+  const fdEffects    = (s.tradeBalanceEffects || []).filter(e => e.isFD);
+  const stockEffects = buildTradeBalanceEffects(sorted, []);
+
+  return {
+    ...s,
+    investmentTx:        sorted,
+    holdings,
+    tradeBalanceEffects: [...stockEffects, ...fdEffects],
+  };
 }
 
 // ─── INVESTMENT DATA MIGRATION LAYER ─────────────────────────────────────────
@@ -194,8 +257,8 @@ function loadLocal() {
 // Solution: On every cold start, scan all known prior keys, find the most
 // recent one that has investment data, migrate its records into the current
 // state format, rebuild holdings + balance effects, and merge additively into
-// the current key.  The source key is then stamped with __migrated_to so
-// migration runs only once per key.
+// the current key. Migration only runs when current state has zero trades —
+// this is the reliable guard against double-counting.
 //
 // Field mapping (old → new):
 //   investments / portfolio / investmentTransactions / trades → investmentTx
@@ -317,6 +380,21 @@ function extractLegacyTrades(raw, fallbackAccountId) {
 // Main migration function — called once at startup inside loadLocal.
 // Returns the merged, migrated state to use as the initial app state.
 function migrateFromOlderVersion(currentState) {
+  // ── GUARD: Never migrate when current state already has investment data ─────
+  // Migration is ONLY for bootstrapping a fresh/empty key from an old one.
+  // If the user already has trades in the current state (whether from a previous
+  // migration, manual entry, or import), we must NOT add legacy trades again —
+  // that would double-count everything.
+  //
+  // The old stamp-based approach (writing __migrated_to on the source key) was
+  // unreliable because the cloud sync overwrites localStorage, erasing the stamp.
+  // This guard is the only reliable protection.
+  const currentTxCount = (currentState.investmentTx || []).length;
+  if (currentTxCount > 0) {
+    console.log("[Migration] Current state has", currentTxCount, "trade(s) — skipping migration.");
+    return currentState;
+  }
+
   let migratedTxs   = [];
   let sourceKeyUsed = null;
 
@@ -324,7 +402,7 @@ function migrateFromOlderVersion(currentState) {
   const keysToScan = [...ALL_LEGACY_KEYS].reverse();
 
   for (const key of keysToScan) {
-    if (key === STORAGE_KEY) continue; // never migrate from ourselves
+    if (key === STORAGE_KEY) continue;
 
     let raw = null;
     try {
@@ -333,12 +411,6 @@ function migrateFromOlderVersion(currentState) {
       raw = JSON.parse(stored);
     } catch (e) {
       console.warn("[Migration] Could not parse key:", key, e);
-      continue;
-    }
-
-    // Skip if already migrated to current version
-    if (raw?.__migrated_to === STORAGE_KEY) {
-      console.log("[Migration] Key already migrated:", key);
       continue;
     }
 
@@ -361,7 +433,7 @@ function migrateFromOlderVersion(currentState) {
     console.log("[Migration] Found", trades.length, "trade record(s) in key:", key);
     migratedTxs   = trades;
     sourceKeyUsed = key;
-    break; // use the most-recent key with data
+    break;
   }
 
   if (migratedTxs.length === 0) {
@@ -369,50 +441,16 @@ function migrateFromOlderVersion(currentState) {
     return currentState;
   }
 
-  // ── Merge migrated trades with any existing trades in current state ──────
-  const existingIds = new Set(
-    (currentState.investmentTx || []).map(t => t.id)
-  );
-  const existingExtIds = new Set(
-    (currentState.investmentTx || [])
-      .filter(t => t.externalTradeId)
-      .map(t => String(t.externalTradeId))
-  );
-
-  const newTxs = migratedTxs.filter(t => {
-    if (existingIds.has(t.id)) return false;                          // exact ID match
-    if (t.externalTradeId && existingExtIds.has(t.externalTradeId)) return false; // ext ID match
-    return true;
-  });
-
-  console.log("[Migration] New (non-duplicate) trades to add:", newTxs.length);
-
-  if (newTxs.length === 0) {
-    console.log("[Migration] All migrated trades already exist — nothing to add.");
-    return currentState;
-  }
-
-  // ── Rebuild holdings + balance effects for the full merged tx list ────────
-  const allTxs = [...(currentState.investmentTx || []), ...newTxs]
-    .sort((a, b) => new Date(a.date) - new Date(b.date));
+  // ── Rebuild holdings + balance effects ───────────────────────────────────
+  const allTxs = [...migratedTxs].sort((a, b) => new Date(a.date) - new Date(b.date));
 
   console.log("[Migration] Rebuilding holdings from", allTxs.length, "total trades...");
-  const { holdings, realizedTrades } = rebuildHoldings(allTxs, []);
+  const { holdings } = rebuildHoldings(allTxs, []);
   console.log("[Migration] Holdings rebuilt:", holdings.length, "open position(s)");
 
   const fdEffects    = (currentState.tradeBalanceEffects || []).filter(e => e.isFD);
   const stockEffects = buildTradeBalanceEffects(allTxs, []);
   console.log("[Migration] Balance effects rebuilt:", stockEffects.length + fdEffects.length, "effect(s)");
-
-  // ── Stamp source key as migrated so we don't run again ───────────────────
-  try {
-    const src = JSON.parse(localStorage.getItem(sourceKeyUsed) || "{}");
-    src.__migrated_to = STORAGE_KEY;
-    localStorage.setItem(sourceKeyUsed, JSON.stringify(src));
-    console.log("[Migration] Stamped source key as migrated:", sourceKeyUsed, "→", STORAGE_KEY);
-  } catch (e) {
-    console.warn("[Migration] Could not stamp source key:", e);
-  }
 
   const mergedState = {
     ...currentState,
@@ -422,7 +460,7 @@ function migrateFromOlderVersion(currentState) {
   };
 
   console.log("[Migration] ✅ Migration complete.",
-    newTxs.length, "trade(s) added,",
+    allTxs.length, "trade(s) migrated,",
     holdings.length, "holding(s) active."
   );
 
@@ -445,7 +483,7 @@ async function pushCloud(userId, s) {
 }
 
 // pullCloud: fetch latest state from Supabase.
-// Returns migrated+sanitized state, or null if nothing stored.
+// Runs deduplication on every pull to fix any doubles that snuck into the cloud.
 async function pullCloud(userId) {
   if (!userId) return null;
   try {
@@ -453,9 +491,9 @@ async function pullCloud(userId) {
       .select("data").eq("id", userId).maybeSingle();
     if (error) { console.warn("[Cloud] Pull error:", error.message); return null; }
     if (!data?.data) return null;
-    const sanitized = sanitize(data.data);
-    // Run migration on cloud data — it may be from an older client version
-    return migrateFromOlderVersion(sanitized);
+    const sanitized  = sanitize(data.data);
+    const deduped    = deduplicateState(sanitized);
+    return deduped;
   } catch(e) {
     console.warn("[Cloud] Pull exception:", e);
     return null;
@@ -717,13 +755,40 @@ function rebuildHoldings(investmentTx, existingHoldings) {
 
     const h = map[key];
 
-    if (tx.type === "buy") {
+    if (tx.type === "buy" || tx.type === "demerger_buy") {
+      // demerger_buy: virtual buy that credits output shares at transferred cost
       const qty   = parseFloat(tx.quantity) || 0;
       const price = parseFloat(tx.price)    || 0;
       h.lots.push({ qty, price, date: tx.date, txId: tx.id });
       h.investedAmount += qty * price;
 
-    } else if (tx.type === "sell") {
+    } else if (tx.type === "demerger_cost_reduce") {
+      // Partial demerger: reduce cost basis of parent without changing share count.
+      // price = cost removed per share; quantity = eligible shares.
+      const qty      = parseFloat(tx.quantity) || 0;
+      const perShare = parseFloat(tx.price)    || 0;
+      const totalReduction = qty * perShare;
+      // Reduce cost from lots proportionally (oldest first)
+      let toRemove = totalReduction;
+      for (let i = 0; i < h.lots.length && toRemove > 0; i++) {
+        const lot = h.lots[i];
+        if (lot.qty <= 0) continue;
+        const lotCost = lot.qty * lot.price;
+        if (lotCost <= toRemove) {
+          // Remove all cost from this lot → reduce lot price to 0
+          toRemove -= lotCost;
+          h.lots[i] = { ...lot, price: 0 };
+        } else {
+          // Partial reduction of this lot
+          const newLotCost = lotCost - toRemove;
+          h.lots[i] = { ...lot, price: newLotCost / lot.qty };
+          toRemove = 0;
+        }
+      }
+      h.investedAmount = Math.max(0, h.investedAmount - totalReduction);
+
+    } else if (tx.type === "sell" || tx.type === "demerger_sell") {
+      // demerger_sell: virtual sell at cost (zero P&L) that removes parent shares
       let remaining  = parseFloat(tx.quantity) || 0;
       const sellPrice = parseFloat(tx.price)   || 0;
 
@@ -863,29 +928,39 @@ function parseGoogleFinancePrice(html) {
 }
 
 async function _fetchViaProxy(url) {
-  // Proxy 1: allorigins.win — wraps response in {contents:"..."}
+  // CORS proxy waterfall — tries each in order, returns first successful response.
+  // allorigins.win removed (blocked by CORS policy in many environments).
+  const sig = () => {
+    try { return AbortSignal.timeout(8000); } catch { return undefined; }
+  };
   const proxies = [
+    // 1. corsproxy.io — reliable, returns raw text
     async (u) => {
-      const r = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(u)}`, {
-        signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
-      });
-      if (!r.ok) throw new Error("allorigins failed");
+      const r = await fetch(`https://corsproxy.io/?${encodeURIComponent(u)}`, { signal: sig() });
+      if (!r.ok) throw new Error("corsproxy.io " + r.status);
+      return await r.text();
+    },
+    // 2. thingproxy.freeboard.io — good secondary
+    async (u) => {
+      const r = await fetch(`https://thingproxy.freeboard.io/fetch/${u}`, { signal: sig() });
+      if (!r.ok) throw new Error("thingproxy " + r.status);
+      return await r.text();
+    },
+    // 3. api.allorigins.win — kept as last resort (wraps in JSON)
+    async (u) => {
+      const r = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(u)}`, { signal: sig() });
+      if (!r.ok) throw new Error("allorigins " + r.status);
       const j = await r.json();
       return j.contents || "";
-    },
-    async (u) => {
-      const r = await fetch(`https://corsproxy.io/?${encodeURIComponent(u)}`, {
-        signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
-      });
-      if (!r.ok) throw new Error("corsproxy failed");
-      return await r.text();
     },
   ];
   for (const proxy of proxies) {
     try {
       const text = await proxy(url);
       if (text && text.length > 100) return text;
-    } catch {}
+    } catch (e) {
+      console.warn("[PriceFetch] Proxy attempt failed:", e.message);
+    }
   }
   return null;
 }
@@ -961,7 +1036,7 @@ function buildTradeBalanceEffects(investmentTx, fixedDeposits) {
   // For each trade: TWO effects — source account and investment account
   const stockEffects = [];
   (investmentTx||[])
-    .filter(itx => !itx.invType?.includes("fd"))
+    .filter(itx => !itx.invType?.includes("fd") && itx.invType !== "demerger_virtual")
     .forEach(itx => {
       const amt = (parseFloat(itx.quantity)||0) * (parseFloat(itx.price)||0);
       if (amt <= 0) return;
@@ -1105,45 +1180,176 @@ function reducer(rawState, action) {
     }
 
     // ── Corporate Actions ──────────────────────────────────────────────────────
-    // ADD_CORPORATE_ACTION: { id, symbol, action_type, ratio, date, note }
+    // ADD_CORPORATE_ACTION: { id, symbol, action_type, ratio, date, note, ... }
     // action_type: stock_split | bonus | reverse_split | dividend | stock_name_change
-    // This stores the action AND updates affected holdings.
+    //              | merger | demerger_partial | demerger_full
     case "ADD_CORPORATE_ACTION": {
       const ca  = action.payload;
       const newActions = [...s.corporateActions, ca];
       let holdings = [...s.holdings];
 
       if (ca.action_type === "stock_split" || ca.action_type === "bonus") {
-        // qty * ratio; avgPrice / ratio
         holdings = holdings.map(h => {
           if (h.symbol !== ca.symbol) return h;
-          const ratio = parseFloat(ca.ratio) || 1;
+          const ratio  = parseFloat(ca.ratio) || 1;
           const newQty = (h.quantity || h.units || 0) * ratio;
           const newAvg = (h.avgPrice || h.nav || 0) / ratio;
           return { ...h, quantity: h.type !== "mf" ? newQty : 0,
-                         units: h.type === "mf" ? newQty : 0,
+                         units:    h.type === "mf" ? newQty : 0,
                          avgPrice: newAvg, nav: newAvg };
         });
+
       } else if (ca.action_type === "reverse_split") {
-        // qty / ratio; avgPrice * ratio
         holdings = holdings.map(h => {
           if (h.symbol !== ca.symbol) return h;
-          const ratio = parseFloat(ca.ratio) || 1;
+          const ratio  = parseFloat(ca.ratio) || 1;
           const newQty = (h.quantity || h.units || 0) / ratio;
           const newAvg = (h.avgPrice || h.nav || 0) * ratio;
           return { ...h, quantity: h.type !== "mf" ? newQty : 0,
-                         units: h.type === "mf" ? newQty : 0,
+                         units:    h.type === "mf" ? newQty : 0,
                          avgPrice: newAvg, nav: newAvg };
         });
+
       } else if (ca.action_type === "stock_name_change") {
-        // Update symbol and name on holdings
         const { new_symbol, new_name } = ca;
         holdings = holdings.map(h => {
           if (h.symbol !== ca.symbol) return h;
           return { ...h, symbol: new_symbol || h.symbol, name: new_name || h.name };
         });
+
+      } else if (ca.action_type === "demerger_partial" || ca.action_type === "demerger_full") {
+        // ── DEMERGER via VIRTUAL TRANSACTIONS ────────────────────────────────
+        //
+        // Architecture: demergers work by injecting virtual investmentTx records
+        // tagged with { demergerCaId: ca.id, invType: "demerger_virtual" }.
+        // Holdings are then FULLY REBUILT from the entire tx ledger.
+        // This means:
+        //   - Selling all output shares → rebuildHoldings gives qty=0 → filtered out
+        //   - Undo = remove virtual txs by caId tag → rebuild again
+        //   - No direct holdings mutation → no stale data ever
+        //
+        // Virtual tx types:
+        //   "demerger_sell" on parent  — removes parent cost basis (full demerger)
+        //   "demerger_buy"  on output  — credits output shares with transferred cost
+        //
+        // Ratio example: Tata Metaliks → Tata Steel  79:10
+        //   share_ratio = 10/79 ≈ 0.1266  (new shares per parent share)
+        //   100 TATAMETALIK → floor(100 × 10/79) = 12 TATASTEEL shares
+
+        const recordDate = ca.record_date || ca.date;
+        const parentSym  = ca.symbol;
+
+        // Eligible shares = net qty held on/before record_date
+        const eligibleTxs = (s.investmentTx || []).filter(
+          tx => tx.symbol === parentSym && tx.date <= recordDate
+        );
+        const { holdings: eligHoldings } = rebuildHoldings(eligibleTxs, []);
+        const eligHolding = eligHoldings.find(h => h.symbol === parentSym);
+        const eligQty     = eligHolding ? (eligHolding.quantity || eligHolding.units || 0) : 0;
+        const eligCost    = eligHolding ? (eligHolding.investedAmount || 0) : 0;
+
+        const parentHolding = (s.holdings || []).find(h => h.symbol === parentSym);
+        if (!parentHolding || eligQty <= 0) {
+          return { ...s, corporateActions: newActions };
+        }
+
+        const virtualTxs = [];
+        const accId       = parentHolding.accountId || "";
+        const currency    = parentHolding.currency  || "INR";
+        const totalCostAllocatedPct = (ca.result_stocks || []).reduce(
+          (sum, rs) => sum + (parseFloat(rs.cost_pct) || 0), 0
+        );
+
+        // ── For FULL demerger: inject a virtual "demerger_sell" on the parent ──
+        // This removes ALL parent shares from the ledger at their avg cost
+        // so rebuildHoldings produces qty=0 for the parent.
+        if (ca.action_type === "demerger_full") {
+          const parentAvgPx = eligQty > 0 ? eligCost / eligQty : 0;
+          virtualTxs.push({
+            id:          "dem_sell_" + ca.id,
+            type:        "demerger_sell",      // treated as "sell" by rebuildHoldings
+            invType:     "demerger_virtual",
+            demergerCaId: ca.id,
+            symbol:      parentSym,
+            name:        parentHolding.name || parentSym,
+            quantity:    eligQty,
+            price:       parentAvgPx,           // sell at cost → zero P&L
+            currency,
+            date:        ca.date,
+            accountId:   accId,
+            note:        `Demerger: ${parentSym} dissolved → ${(ca.result_stocks||[]).map(r=>r.symbol).join(", ")}`,
+          });
+        }
+
+        // ── For PARTIAL demerger: inject a cost-reduction tx on parent ─────────
+        // We inject a virtual "demerger_cost_reduce" that reduces the parent's
+        // investedAmount by the allocated portion without changing share count.
+        // rebuildHoldings handles this as a special tx type.
+        if (ca.action_type === "demerger_partial") {
+          const costToAllocate = eligCost * (totalCostAllocatedPct / 100);
+          const perShareReduction = eligQty > 0 ? costToAllocate / eligQty : 0;
+          virtualTxs.push({
+            id:           "dem_cost_" + ca.id,
+            type:         "demerger_cost_reduce",
+            invType:      "demerger_virtual",
+            demergerCaId: ca.id,
+            symbol:       parentSym,
+            name:         parentHolding.name || parentSym,
+            quantity:     eligQty,
+            price:        perShareReduction,   // cost removed per share
+            currency,
+            date:         ca.date,
+            accountId:    accId,
+            note:         `Demerger cost transfer: ${totalCostAllocatedPct}% of ${parentSym} cost → output stocks`,
+          });
+        }
+
+        // ── Inject virtual "demerger_buy" for each output stock ───────────────
+        (ca.result_stocks || []).forEach(rs => {
+          const outSym     = rs.symbol.toUpperCase();
+          const shareRatio = parseFloat(rs.share_ratio) || 0;
+          const costPct    = parseFloat(rs.cost_pct)    || 0;
+          const newShares  = Math.floor(eligQty * shareRatio);
+          if (newShares <= 0) return;
+          const costAlloc  = eligCost * (costPct / 100);
+          const avgPx      = costAlloc / newShares;
+
+          virtualTxs.push({
+            id:           "dem_buy_" + ca.id + "_" + outSym,
+            type:         "demerger_buy",     // treated as "buy" by rebuildHoldings
+            invType:      "demerger_virtual",
+            demergerCaId: ca.id,
+            symbol:       outSym,
+            name:         rs.name || outSym,
+            quantity:     newShares,
+            price:        avgPx,
+            currency,
+            date:         ca.date,
+            accountId:    rs.accountId || accId,
+            note:         `Demerger: ${newShares} ${outSym} from ${eligQty} ${parentSym} (ratio ${rs.share_ratio}:1, ${costPct}% cost)`,
+          });
+
+          // Auto-add output stock to stocks master if not present
+          if (!(s.stocks || []).find(st => st.symbol === outSym)) {
+            // We can't dispatch inside reducer; the UI save() handles ADD_STOCK before dispatching the CA
+          }
+        });
+
+        // ── Rebuild entire holdings from all txs + new virtual txs ─────────────
+        const allTxs = [...(s.investmentTx || []), ...virtualTxs];
+        const { holdings: rebuiltHoldings, realizedTrades } = rebuildHoldings(allTxs, []);
+        const newEffects = buildTradeBalanceEffects(allTxs, s.fixedDeposits || []);
+
+        return {
+          ...s,
+          corporateActions:   newActions,
+          investmentTx:       allTxs,
+          holdings:           rebuiltHoldings,
+          tradeBalanceEffects: newEffects,
+        };
       }
-      // dividend: income only — create a transaction instead (handled in UI)
+
+      // dividend: income only — handled in UI
       return { ...s, corporateActions: newActions, holdings };
     }
 
@@ -1163,6 +1369,7 @@ function reducer(rawState, action) {
           const newAvg = (h.avgPrice||h.nav||0) * ratio;
           return { ...h, quantity: h.type!=="mf"?newQty:0, units: h.type==="mf"?newQty:0, avgPrice:newAvg, nav:newAvg };
         });
+
       } else if (ca.action_type === "reverse_split") {
         const ratio = parseFloat(ca.ratio)||1;
         holdings = holdings.map(h => {
@@ -1171,23 +1378,36 @@ function reducer(rawState, action) {
           const newAvg = (h.avgPrice||h.nav||0) / ratio;
           return { ...h, quantity: h.type!=="mf"?newQty:0, units: h.type==="mf"?newQty:0, avgPrice:newAvg, nav:newAvg };
         });
+
       } else if (ca.action_type === "stock_name_change") {
-        // Reverse: rename back to old symbol
         holdings = holdings.map(h => {
           if (h.symbol !== ca.new_symbol) return h;
           return { ...h, symbol: ca.symbol, name: ca.old_name||ca.symbol };
         });
+
       } else if (ca.action_type === "merger") {
-        // Reverse merger: remove the merged-into stock holdings (simplistic)
         holdings = holdings.filter(h => h.symbol !== (ca.to_symbol||ca.symbol));
-      } else if (ca.action_type === "demerger") {
-        // Reverse demerger: remove the newly created split stocks
-        const newSymbols = (ca.result_symbols||[]).filter(sym => sym !== ca.symbol);
-        holdings = holdings.filter(h => !newSymbols.includes(h.symbol));
+
+      } else if (ca.action_type === "demerger_partial" || ca.action_type === "demerger_full") {
+        // ── UNDO DEMERGER — remove virtual txs and rebuild holdings ─────────────
+        // Virtual txs are tagged with { demergerCaId: ca.id }.
+        // Remove all of them, then rebuild holdings from the clean ledger.
+        const cleanTxs = (s.investmentTx || []).filter(
+          tx => tx.demergerCaId !== ca.id
+        );
+        const { holdings: rebuiltHoldings } = rebuildHoldings(cleanTxs, []);
+        const newEffects = buildTradeBalanceEffects(cleanTxs, s.fixedDeposits || []);
+        return {
+          ...s,
+          corporateActions:    newActions,
+          investmentTx:        cleanTxs,
+          holdings:            rebuiltHoldings,
+          tradeBalanceEffects: newEffects,
+        };
       }
+
       return { ...s, corporateActions: newActions, holdings };
     }
-
     // ── Bulk Delete Holdings ──────────────────────────────────────────────────
     case "BULK_DELETE_HOLDINGS": {
       const symbols = action.payload;
@@ -1323,7 +1543,8 @@ function reducer(rawState, action) {
     case "DELETE_INVESTMENT_TX": {
       const tid = action.payload;
       if (!tid) return s;
-      const newTxs = s.investmentTx.filter(t => t.id !== tid);
+      // Demerger virtual txs cannot be deleted individually — delete the corporate action instead
+      const newTxs = s.investmentTx.filter(t => t.id !== tid && t.invType !== "demerger_virtual");
       if (newTxs.length === s.investmentTx.length) return s;
       const { holdings: rebuilt } = rebuildHoldings(newTxs, s.holdings);
       const stockEffects = buildTradeBalanceEffects(newTxs, []);
@@ -1335,7 +1556,8 @@ function reducer(rawState, action) {
     case "BULK_DELETE_INVESTMENT_TXS": {
       const ids = new Set(action.payload || []);
       if (ids.size === 0) return s;
-      const newTxs = s.investmentTx.filter(t => !ids.has(t.id));
+      // Never delete demerger virtual txs — delete the corporate action to undo
+      const newTxs = s.investmentTx.filter(t => !ids.has(t.id) || t.invType === "demerger_virtual");
       if (newTxs.length === s.investmentTx.length) return s;
       const { holdings: rebuilt } = rebuildHoldings(newTxs, s.holdings);
       const stockEffects = buildTradeBalanceEffects(newTxs, []);
@@ -3395,28 +3617,41 @@ function TradeHistoryModal({ symbol, holding, investmentTx, accounts, state, dis
             return (
               <div key={t.id} style={{padding:"12px 0",borderBottom:"1px solid #F1F5F9"}}>
                 <div style={{display:"flex",alignItems:"flex-start",gap:10}}>
-                  <span style={{fontSize:11,background:t.type==="buy"?"#F0FDF4":"#FEF2F2",color:t.type==="buy"?"#10B981":"#EF4444",padding:"3px 8px",borderRadius:10,fontWeight:700,flexShrink:0,marginTop:2}}>{t.type.toUpperCase()}</span>
+                  <span style={{fontSize:11,padding:"3px 8px",borderRadius:10,fontWeight:700,flexShrink:0,marginTop:2,
+                      background:{buy:"#F0FDF4",sell:"#FEF2F2",demerger_buy:"#EEF2FF",demerger_sell:"#F5F3FF",demerger_cost_reduce:"#FFF7ED"}[t.type]||"#F1F5F9",
+                      color:{buy:"#10B981",sell:"#EF4444",demerger_buy:"#6366F1",demerger_sell:"#7C3AED",demerger_cost_reduce:"#D97706"}[t.type]||"#64748B"}}>
+                      {(t.type==="demerger_buy"?"DEMERGER IN":t.type==="demerger_sell"?"DEMERGER OUT":t.type==="demerger_cost_reduce"?"COST ADJ":t.type==="buy"?"BUY":t.type==="sell"?"SELL":t.type.toUpperCase())}
+                    </span>
                   <div style={{flex:1,minWidth:0}}>
                     <div style={{fontWeight:700,fontSize:14,color:"#0F172A"}}>{fmtNum(t.quantity)} × {fmtCur(t.price,cur)}</div>
                     <div style={{fontSize:12,color:"#64748B",marginTop:2}}>{fmtDate(t.date)}{srcAcc?` · ${srcAcc.name}`:""}{t.note?` · ${t.note}`:""}</div>
                   </div>
                   <div style={{textAlign:"right",flexShrink:0}}>
-                    <div style={{fontWeight:700,fontSize:14,color:t.type==="buy"?"#EF4444":"#10B981"}}>
-                      {t.type==="buy"?"−":"+"}{ fmtCur(total,cur)}
+                    <div style={{fontWeight:700,fontSize:14,
+                      color:t.invType==="demerger_virtual"?"#6366F1":t.type==="buy"?"#EF4444":"#10B981"}}>
+                      {t.invType==="demerger_virtual"?"⇄":t.type==="buy"?"−":"+"}{fmtCur(total,cur)}
                     </div>
-                    <div style={{fontSize:10,color:"#94A3B8",marginTop:2}}>total</div>
+                    <div style={{fontSize:10,color:"#94A3B8",marginTop:2}}>
+                      {t.invType==="demerger_virtual"?"demerger":"total"}
+                    </div>
                   </div>
                 </div>
-                <div style={{display:"flex",gap:8,marginTop:10}}>
-                  <button onClick={()=>setEditTrade(t)}
-                    style={{flex:1,fontSize:12,padding:"7px 0",borderRadius:8,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
-                    ✏️ Edit
-                  </button>
-                  <button onClick={()=>deleteTrade(t)}
-                    style={{flex:1,fontSize:12,padding:"7px 0",borderRadius:8,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
-                    🗑️ Delete
-                  </button>
-                </div>
+                {t.invType==="demerger_virtual"?(
+                  <div style={{marginTop:8,fontSize:11,color:"#6366F1",background:"#EEF2FF",borderRadius:6,padding:"4px 8px",display:"inline-block"}}>
+                    🔒 Auto-generated by demerger corporate action · Delete the corporate action to remove
+                  </div>
+                ):(
+                  <div style={{display:"flex",gap:8,marginTop:10}}>
+                    <button onClick={()=>setEditTrade(t)}
+                      style={{flex:1,fontSize:12,padding:"7px 0",borderRadius:8,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+                      ✏️ Edit
+                    </button>
+                    <button onClick={()=>deleteTrade(t)}
+                      style={{flex:1,fontSize:12,padding:"7px 0",borderRadius:8,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+                      🗑️ Delete
+                    </button>
+                  </div>
+                )}
               </div>
             );
           })}
@@ -3772,8 +4007,10 @@ function ImportModal({ state, dispatch, onClose }) {
       sample: [["2024-01-01","50000","Salary","SBI Savings","Jan salary"]],
     },
     trade: {
-      cols:   ["Date","Symbol","Type","Quantity","Price","InvestmentAccount","SourceAccount","Note"],
-      sample: [["2024-01-10","TCS","buy","10","3500","Zerodha","SBI Savings","Q4 buy"]],
+      cols:   ["Date","Symbol","Type","Quantity","Price","InvestmentAccount","SourceAccount","Note","trade_id"],
+      sample: [["2024-01-10","TCS","buy","10","3500","Zerodha","SBI Savings","Q4 buy","T0001"]],
+      // trade_id is optional — leave blank if not available.
+      // When present it is the primary dedup key (prevents re-importing the same trade).
     },
 
     // ── ZERODHA_TRADEBOOK_V2 ──────────────────────────────────────────────
@@ -3933,8 +4170,11 @@ function ImportModal({ state, dispatch, onClose }) {
     } else {
       // ── Standard (native) template validation ─────────────────────────────
       const expected = tmpl.cols;
+      // trade_id is optional in the native trade template
+      const OPTIONAL_COLS = ["trade_id"];
       const missing  = expected.filter(
-        col => !headers.some(h => h.toLowerCase() === col.toLowerCase())
+        col => !OPTIONAL_COLS.includes(col.toLowerCase()) &&
+               !headers.some(h => h.toLowerCase() === col.toLowerCase())
       );
       if (missing.length > 0) { setErrors(["Missing columns: " + missing.join(", ")]); return; }
 
@@ -4084,6 +4324,7 @@ function ImportModal({ state, dispatch, onClose }) {
       // ══════════════════════════════════════════════════════════════════════
       // STANDARD FORMAT: native trade (Date/Symbol/Type/Qty/Price/…)
       // Uses user-selected accounts (selInvAccId / selSrcAccId)
+      // trade_id column (optional) is the primary dedup key when present.
       // ══════════════════════════════════════════════════════════════════════
       if (importType === "trade") {
         try {
@@ -4091,8 +4332,17 @@ function ImportModal({ state, dispatch, onClose }) {
           const tradeType = (row.type || "buy").toLowerCase();
           const qty       = parseFloat(row.quantity) || 0;
           const price     = parseFloat(row.price)    || 0;
-          const fp        = tradeType+"|"+row.date+"|"+sym+"|"+qty+"|"+price+"|"+selInvAccId;
-          if (existingTradeFP.has(fp)) { skipped++; return; }
+          const extId     = (row.trade_id || "").trim();
+
+          // Tier 1: dedup by trade_id if present
+          if (extId && existingExtIds.has(extId)) { skipped++; return; }
+
+          // Tier 2: dedup by content fingerprint (only when no trade_id)
+          if (!extId) {
+            const fp = tradeType+"|"+row.date+"|"+sym+"|"+qty+"|"+price+"|"+selInvAccId;
+            if (existingTradeFP.has(fp)) { skipped++; return; }
+            existingTradeFP.add(fp);
+          }
 
           const invAcc   = allAccounts.find(a => a.id === selInvAccId);
           const currency = invAcc?.currency || "INR";
@@ -4112,10 +4362,11 @@ function ImportModal({ state, dispatch, onClose }) {
             sourceAccountId: selSrcAccId,
             brokerage:       0,
             note:            row.note || "",
+            externalTradeId: extId || undefined,
           };
 
           tradesToImport.push(itx);
-          existingTradeFP.add(fp);
+          if (extId) existingExtIds.add(extId); // intra-batch dedup
           imported++;
         } catch(e) {
           console.warn("Import trade error:", e);
@@ -4276,6 +4527,7 @@ function ImportModal({ state, dispatch, onClose }) {
         const existingTradeFP = new Set(
           (state?.investmentTx||[]).map(t=>t.type+"|"+t.date+"|"+(t.symbol||"").toUpperCase()+"|"+t.quantity+"|"+t.price+"|"+t.accountId)
         );
+        // externalTradeIds shared across both broker AND native trade imports
         const existingExtIds = new Set(
           (state?.investmentTx||[]).filter(t=>t.externalTradeId).map(t=>String(t.externalTradeId))
         );
@@ -4295,10 +4547,16 @@ function ImportModal({ state, dispatch, onClose }) {
             const fp     = importType+"|"+row.date+"|"+(parseFloat(row.amount)||0)+"|"+(acc?.id||"")+"|"+(catObj?.id||"");
             if (existingTxFP.has(fp)) dupCount++;
           } else if (importType==="trade") {
-            const invAcc = accts.find(a=>a.name.toLowerCase()===(row.investmentaccount||"").toLowerCase());
-            const sym    = (row.symbol||"").toUpperCase();
-            const fp     = (row.type?.toLowerCase()||"buy")+"|"+row.date+"|"+sym+"|"+(parseFloat(row.quantity)||0)+"|"+(parseFloat(row.price)||0)+"|"+(invAcc?.id||"");
-            if (existingTradeFP.has(fp)) dupCount++;
+            const extId = (row.trade_id||"").trim();
+            if (extId) {
+              // Tier 1: trade_id dedup
+              if (existingExtIds.has(extId)) dupCount++;
+            } else {
+              // Tier 2: fingerprint dedup
+              const sym = (row.symbol||"").toUpperCase();
+              const fp  = (row.type?.toLowerCase()||"buy")+"|"+row.date+"|"+sym+"|"+(parseFloat(row.quantity)||0)+"|"+(parseFloat(row.price)||0)+"|"+selInvAccId;
+              if (existingTradeFP.has(fp)) dupCount++;
+            }
           }
         });
 
@@ -4408,7 +4666,10 @@ function CorporateActionModal({ state, dispatch, onClose }) {
   const [toSymbol,   setToSymbol]  = useState("");
   const [toName,     setToName]    = useState("");
   // Demerger fields
-  const [demergerResults, setDemergerResults] = useState([{symbol:"",name:"",ratio:"1"}]);
+  const [demergerType,    setDemergerType]    = useState("partial"); // "partial" | "full"
+  const [demergerResults, setDemergerResults] = useState([
+    { symbol:"", name:"", share_ratio:"", cost_pct:"" },
+  ]);
 
   const ACTION_TYPES = [
     { value:"stock_split",       label:"📈 Stock Split",         desc:"1→2: qty doubles, price halves" },
@@ -4416,15 +4677,51 @@ function CorporateActionModal({ state, dispatch, onClose }) {
     { value:"bonus",             label:"🎁 Bonus Issue",          desc:"Extra shares, invested value unchanged" },
     { value:"dividend",          label:"💰 Dividend",             desc:"Cash payout credited to account" },
     { value:"stock_name_change", label:"✏️ Name/Symbol Change",  desc:"Rename symbol, keep trade history" },
-    { value:"merger",            label:"🔀 Merger",               desc:"Stock A merges into B" },
-    { value:"demerger",          label:"🪢 Demerger",             desc:"Stock splits into multiple stocks" },
+    { value:"merger",              label:"🔀 Merger",                  desc:"Stock A merges into B" },
+    { value:"demerger_partial",    label:"🪢 Partial Demerger",        desc:"A → A + B  (parent continues)" },
+    { value:"demerger_full",       label:"✂️ Full Demerger",           desc:"A → B + C  (parent dissolved)" },
   ];
 
   const bankAccs = accounts.filter(a=>!a.isCreditCard&&!(a.is_active===false)&&!a.disabled);
 
-  function addDemergerResult()   { setDemergerResults(r=>[...r,{symbol:"",name:"",ratio:"1"}]); }
-  function delDemergerResult(i)  { setDemergerResults(r=>r.filter((_,j)=>j!==i)); }
+  function addDemergerResult()      { setDemergerResults(r=>[...r,{symbol:"",name:"",share_ratio:"",cost_pct:""}]); }
+  function delDemergerResult(i)     { setDemergerResults(r=>r.filter((_,j)=>j!==i)); }
   function updDemergerResult(i,k,v) { setDemergerResults(r=>r.map((x,j)=>j===i?{...x,[k]:v}:x)); }
+
+  // Auto-distribute cost_pct equally across all output stocks
+  function autoCostPct() {
+    const n = demergerResults.length;
+    if (n === 0) return;
+    const each = (100 / n).toFixed(2);
+    setDemergerResults(r => r.map((x, i) => ({
+      ...x, cost_pct: i < n - 1 ? each : String((100 - parseFloat(each) * (n-1)).toFixed(2))
+    })));
+  }
+
+  // Compute total cost_pct for validation display
+  const totalCostPct = demergerResults.reduce((s,r)=>s+(parseFloat(r.cost_pct)||0), 0);
+
+  // Eligible shares for preview — trades on/before record_date (or today)
+  const investmentTx = state?.investmentTx || [];
+  function getEligibleShares(sym, recordDate) {
+    if (!sym || !recordDate) return 0;
+    const txs = investmentTx.filter(tx => tx.symbol === sym && tx.date <= recordDate);
+    if (txs.length === 0) return 0;
+    return txs.reduce((qty, tx) => {
+      if (tx.type === "buy")  return qty + (parseFloat(tx.quantity)||0);
+      if (tx.type === "sell") return qty - (parseFloat(tx.quantity)||0);
+      return qty;
+    }, 0);
+  }
+  const eligibleShares = getEligibleShares(symbol, date);
+  const parentHolding  = holdings.find(h => h.symbol === symbol);
+  // Eligible cost = proportional slice of full holding cost for the eligible shares only.
+  // e.g. 47 eligible out of 115 total → 47/115 of ₹43,999 = ₹17,982
+  const parentTotalQty = parentHolding ? (parentHolding.quantity || parentHolding.units || 0) : 0;
+  const parentFullCost = parentHolding?.investedAmount || 0;
+  const eligibleCost   = parentTotalQty > 0
+    ? parentFullCost * (eligibleShares / parentTotalQty)
+    : 0;
 
   function save() {
     if (!symbol) { alert("Select a symbol"); return; }
@@ -4472,20 +4769,60 @@ function CorporateActionModal({ state, dispatch, onClose }) {
       onClose(); return;
     }
 
-    if (actionType==="demerger") {
-      const valid = demergerResults.filter(r=>r.symbol.trim());
-      if (valid.length===0) { alert("Add at least one resulting stock"); return; }
-      const r = parseFloat(ratio)||1;
-      // Auto-add new stocks to master
-      valid.forEach(res=>{
+    if (actionType==="demerger_partial" || actionType==="demerger_full") {
+      const valid = demergerResults.filter(r => r.symbol.trim());
+      if (valid.length === 0) { alert("Add at least one output stock"); return; }
+      // Validate each output stock has a share_ratio
+      for (const r of valid) {
+        if (!parseFloat(r.share_ratio) || parseFloat(r.share_ratio) <= 0) {
+          alert(`Share ratio for ${r.symbol||"a stock"} must be greater than 0`); return;
+        }
+        if (!parseFloat(r.cost_pct) || parseFloat(r.cost_pct) <= 0) {
+          alert(`Cost allocation % for ${r.symbol||"a stock"} must be greater than 0`); return;
+        }
+      }
+      const sumCostPct = valid.reduce((s,r)=>s+(parseFloat(r.cost_pct)||0),0);
+      // For full demerger cost must sum to 100%; partial can be < 100% (remainder stays with parent)
+      if (actionType==="demerger_full" && Math.abs(sumCostPct - 100) > 0.5) {
+        alert(`For a Full Demerger, cost allocation must total 100% (currently ${sumCostPct.toFixed(1)}%)`); return;
+      }
+      if (actionType==="demerger_partial" && sumCostPct >= 100) {
+        alert(`For a Partial Demerger, cost allocation total must be less than 100% (currently ${sumCostPct.toFixed(1)}%)
+The remainder stays with the parent stock.`); return;
+      }
+      if (eligibleShares <= 0) { alert(`No eligible shares found for ${symbol} on or before ${date}`); return; }
+
+      // Auto-add output stocks to master if not present
+      valid.forEach(res => {
         const sym = res.symbol.toUpperCase();
-        if (!stocks.find(s=>s.symbol===sym)) {
-          dispatch({type:"ADD_STOCK",payload:{id:uid(),symbol:sym,name:res.name||sym,type:"stock",exchange:""}});
+        if (!stocks.find(s => s.symbol === sym)) {
+          dispatch({type:"ADD_STOCK", payload:{id:uid(),symbol:sym,name:res.name||sym,type:"stock",exchange:""}});
         }
       });
-      const ca = {id:uid(),symbol,action_type:"demerger",ratio:r,result_symbols:valid.map(r=>r.toUpperCase?r.toUpperCase():r.symbol.toUpperCase()),result_stocks:valid.map(r=>({symbol:r.symbol.toUpperCase(),name:r.name||r.symbol,ratio:parseFloat(r.ratio)||1})),date,note};
-      dispatch({type:"ADD_CORPORATE_ACTION",payload:ca});
-      toast(`Demerger applied: ${symbol} → ${valid.map(r=>r.symbol.toUpperCase()).join(", ")}`);
+
+      const ca = {
+        id:             uid(),
+        symbol,
+        action_type:    actionType,
+        demerger_type:  actionType === "demerger_partial" ? "partial" : "full",
+        record_date:    date,
+        date,
+        note,
+        eligible_shares: eligibleShares,
+        eligible_cost:   eligibleCost,
+        result_stocks:  valid.map(r => ({
+          symbol:      r.symbol.toUpperCase(),
+          name:        r.name || r.symbol.toUpperCase(),
+          share_ratio: parseFloat(r.share_ratio) || 0,
+          cost_pct:    parseFloat(r.cost_pct) || 0,
+          accountId:   parentHolding?.accountId || "",
+        })),
+        // No snapshot_holdings needed — undo works by removing virtual investmentTx records
+      };
+
+      dispatch({type:"ADD_CORPORATE_ACTION", payload:ca});
+      const outStr = valid.map(r => `${r.symbol.toUpperCase()} (${r.share_ratio}:1, ${r.cost_pct}%)`).join(", ");
+      toast(`${actionType==="demerger_partial"?"Partial":"Full"} demerger applied: ${symbol} → ${outStr}`);
       onClose(); return;
     }
 
@@ -4522,16 +4859,46 @@ function CorporateActionModal({ state, dispatch, onClose }) {
               <div style={{fontSize:36}}>📋</div>
               <div style={{marginTop:8}}>No corporate actions yet</div>
             </div>
-          ) : [...corpActions].reverse().map(ca=>(
-            <div key={ca.id} style={{display:"flex",alignItems:"flex-start",gap:10,padding:"12px 0",borderBottom:"1px solid #F1F5F9"}}>
-              <div style={{flex:1,minWidth:0}}>
-                <div style={{fontWeight:700,fontSize:13,color:"#0F172A"}}>{ca.symbol} · {ca.action_type.replace(/_/g," ")}</div>
-                <div style={{fontSize:11,color:"#64748B",marginTop:2}}>{fmtDate(ca.date)}{ca.ratio?` · ×${ca.ratio}`:""}{ca.new_symbol?` → ${ca.new_symbol}`:""}{ca.to_symbol?` → ${ca.to_symbol}`:""}{ca.note?` · ${ca.note}`:""}</div>
-              </div>
-              <button onClick={()=>deleteAction(ca)}
+          ) : [...corpActions].reverse().map(ca=>{
+            const isDem = ca.action_type==="demerger_partial"||ca.action_type==="demerger_full"||ca.action_type==="demerger";
+            const actionLabel = {
+              stock_split:"📈 Stock Split", reverse_split:"📉 Reverse Split",
+              bonus:"🎁 Bonus Issue", dividend:"💰 Dividend",
+              stock_name_change:"✏️ Name Change", merger:"🔀 Merger",
+              demerger_partial:"🪢 Partial Demerger", demerger_full:"✂️ Full Demerger",
+              demerger:"🪢 Demerger (legacy)",
+            }[ca.action_type] || ca.action_type.replace(/_/g," ");
+            return (
+            <div key={ca.id} style={{padding:"12px 0",borderBottom:"1px solid #F1F5F9"}}>
+              <div style={{display:"flex",alignItems:"flex-start",gap:10}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontWeight:700,fontSize:13,color:"#0F172A"}}>{ca.symbol} · {actionLabel}</div>
+                  <div style={{fontSize:11,color:"#64748B",marginTop:2}}>
+                    {fmtDate(ca.date)}
+                    {ca.ratio?` · ×${ca.ratio}`:""}
+                    {ca.new_symbol?` → ${ca.new_symbol}`:""}
+                    {ca.to_symbol?` → ${ca.to_symbol}`:""}
+                    {ca.note?` · ${ca.note}`:""}
+                    {isDem && ca.eligible_shares ? ` · ${Math.floor(ca.eligible_shares).toLocaleString("en-IN")} eligible shares` : ""}
+                  </div>
+                  {/* Demerger output stocks detail */}
+                  {isDem && (ca.result_stocks||[]).length > 0 && (
+                    <div style={{marginTop:6,display:"flex",flexWrap:"wrap",gap:5}}>
+                      {(ca.result_stocks||[]).map(rs=>(
+                        <div key={rs.symbol} style={{background:"#EEF2FF",borderRadius:6,padding:"3px 8px",fontSize:11,color:"#4338CA",fontWeight:600}}>
+                          {rs.symbol}
+                          {rs.share_ratio ? ` ×${rs.share_ratio}` : rs.ratio ? ` ×${rs.ratio}` : ""}
+                          {rs.cost_pct ? ` · ${rs.cost_pct}% cost` : ""}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <button onClick={()=>deleteAction(ca)}
                 style={{fontSize:11,padding:"4px 10px",borderRadius:7,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:600,flexShrink:0}}>🗑️ Delete</button>
             </div>
-          ))}
+            </div>  
+          );})}
           <Btn variant="ghost" onClick={onClose} style={{width:"100%",marginTop:16}}>Close</Btn>
         </div>
       )}
@@ -4593,19 +4960,101 @@ function CorporateActionModal({ state, dispatch, onClose }) {
             </>
           )}
 
-          {actionType==="demerger"&&(
+          {(actionType==="demerger_partial"||actionType==="demerger_full")&&(
             <>
-              <Field label="Resulting Stocks">
-                {demergerResults.map((r,i)=>(
-                  <div key={i} style={{display:"grid",gridTemplateColumns:"1fr 1fr 60px 28px",gap:6,marginBottom:6,alignItems:"end"}}>
-                    <Inp label={i===0?"Symbol":""} value={r.symbol} onChange={e=>updDemergerResult(i,"symbol",e.target.value.toUpperCase())} placeholder="Symbol" style={{marginBottom:0}} />
-                    <Inp label={i===0?"Name":""} value={r.name} onChange={e=>updDemergerResult(i,"name",e.target.value)} placeholder="Name" style={{marginBottom:0}} />
-                    <Inp label={i===0?"Ratio":""} type="number" value={r.ratio} onChange={e=>updDemergerResult(i,"ratio",e.target.value)} placeholder="1" style={{marginBottom:0}} />
-                    <button onClick={()=>delDemergerResult(i)} style={{width:28,height:42,borderRadius:7,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>×</button>
+              {/* Eligible shares preview */}
+              <div style={{background:"#F0F9FF",border:"1.5px solid #BAE6FD",borderRadius:10,padding:12,marginBottom:12}}>
+                <div style={{fontWeight:700,fontSize:12,color:"#0369A1",marginBottom:6}}>
+                  📊 Eligible Shares Preview
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,fontSize:12}}>
+                  <div>
+                    <div style={{color:"#64748B"}}>Eligible Shares (on/before {date||"record date"})</div>
+                    <div style={{fontWeight:700,fontSize:16,color:"#0F172A"}}>{eligibleShares > 0 ? Math.floor(eligibleShares).toLocaleString("en-IN") : "—"}</div>
                   </div>
-                ))}
-                <Btn variant="ghost" size="sm" onClick={addDemergerResult} style={{width:"100%",marginTop:4}}>+ Add Stock</Btn>
+                  <div>
+                    <div style={{color:"#64748B"}}>Eligible Cost Basis</div>
+                    <div style={{fontWeight:700,fontSize:16,color:"#0F172A"}}>{eligibleCost > 0 ? fmtINR(eligibleCost) : "—"}</div>
+                  </div>
+                </div>
+                {actionType==="demerger_partial" && (
+                  <div style={{marginTop:6,fontSize:11,color:"#0369A1"}}>
+                    ℹ️ Parent stock <strong>{symbol}</strong> continues — only cost basis reduces.
+                  </div>
+                )}
+                {actionType==="demerger_full" && (
+                  <div style={{marginTop:6,fontSize:11,color:"#7C3AED"}}>
+                    ⚠️ Parent stock <strong>{symbol}</strong> will be dissolved — all shares removed.
+                  </div>
+                )}
+              </div>
+
+              {/* Output stocks table */}
+              <Field label="Output Stocks">
+                {/* Header row */}
+                <div style={{display:"grid",gridTemplateColumns:"90px 1fr 70px 70px 28px",gap:5,marginBottom:4}}>
+                  {["Symbol","Name","Ratio","Cost %",""].map((h,i)=>(
+                    <div key={i} style={{fontSize:10,fontWeight:700,color:"#94A3B8",textTransform:"uppercase"}}>{h}</div>
+                  ))}
+                </div>
+                {demergerResults.map((r,i)=>{
+                  const newShares = eligibleShares > 0 && r.share_ratio
+                    ? Math.floor(eligibleShares * (parseFloat(r.share_ratio)||0))
+                    : null;
+                  return (
+                    <div key={i}>
+                      <div style={{display:"grid",gridTemplateColumns:"90px 1fr 70px 70px 28px",gap:5,marginBottom:4,alignItems:"center"}}>
+                        <Inp value={r.symbol} onChange={e=>updDemergerResult(i,"symbol",e.target.value.toUpperCase())} placeholder="SYMBOL" style={{marginBottom:0,fontFamily:"monospace"}} />
+                        <Inp value={r.name} onChange={e=>updDemergerResult(i,"name",e.target.value)} placeholder="Name" style={{marginBottom:0}} />
+                        <Inp type="number" inputMode="decimal" value={r.share_ratio} onChange={e=>updDemergerResult(i,"share_ratio",e.target.value)} placeholder="e.g. 0.1" style={{marginBottom:0}} />
+                        <Inp type="number" inputMode="decimal" value={r.cost_pct} onChange={e=>updDemergerResult(i,"cost_pct",e.target.value)} placeholder="%" style={{marginBottom:0}} />
+                        <button onClick={()=>delDemergerResult(i)} style={{width:28,height:38,borderRadius:7,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",justifyContent:"center"}}>×</button>
+                      </div>
+                      {/* Per-row preview */}
+                      {newShares !== null && r.symbol && (
+                        <div style={{fontSize:10,color:"#6366F1",marginBottom:6,paddingLeft:2}}>
+                          → {newShares} {r.symbol} shares · {r.cost_pct?fmtINR(eligibleCost*(parseFloat(r.cost_pct)||0)/100):"₹?"} cost allocated
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+
+                <div style={{display:"flex",gap:6,marginTop:4}}>
+                  <Btn variant="ghost" size="sm" onClick={addDemergerResult} style={{flex:1}}>+ Add Stock</Btn>
+                  <Btn variant="ghost" size="sm" onClick={autoCostPct} style={{flex:1}}>⚖️ Split Cost Equally</Btn>
+                </div>
               </Field>
+
+              {/* Cost allocation summary */}
+              <div style={{
+                background: Math.abs(totalCostPct - (actionType==="demerger_full"?100:totalCostPct)) < 0.5 && totalCostPct > 0
+                  ? "#F0FDF4" : "#FFFBEB",
+                border: `1.5px solid ${Math.abs(totalCostPct - (actionType==="demerger_full"?100:totalCostPct)) < 0.5 && totalCostPct > 0 ? "#A7F3D0" : "#FDE68A"}`,
+                borderRadius:9, padding:"10px 12px", marginBottom:8,
+              }}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <span style={{fontSize:12,fontWeight:600,color:"#374151"}}>Total Cost Allocated:</span>
+                  <span style={{fontWeight:800,fontSize:14,color: totalCostPct > 100 ? "#EF4444" : "#0F172A"}}>
+                    {totalCostPct.toFixed(1)}%
+                  </span>
+                </div>
+                {actionType==="demerger_partial" && totalCostPct < 100 && totalCostPct > 0 && (
+                  <div style={{fontSize:11,color:"#92400E",marginTop:3}}>
+                    {(100-totalCostPct).toFixed(1)}% stays with {symbol} (parent)
+                  </div>
+                )}
+                {actionType==="demerger_full" && Math.abs(totalCostPct-100) > 0.5 && (
+                  <div style={{fontSize:11,color:"#DC2626",marginTop:3}}>
+                    ⚠️ Full demerger requires exactly 100% — currently {totalCostPct.toFixed(1)}%
+                  </div>
+                )}
+                {actionType==="demerger_partial" && totalCostPct >= 100 && (
+                  <div style={{fontSize:11,color:"#DC2626",marginTop:3}}>
+                    ⚠️ Partial demerger must be less than 100%
+                  </div>
+                )}
+              </div>
             </>
           )}
 
@@ -4884,7 +5333,11 @@ function InvestmentsView({ state, dispatch }) {
                             setSelectedTrades(s);
                           }}
                           style={{width:16,height:16,marginTop:3,cursor:"pointer",flexShrink:0}} />
-                        <span style={{fontSize:11,background:itx.type==="buy"?"#F0FDF4":"#FEF2F2",color:itx.type==="buy"?"#10B981":"#EF4444",padding:"3px 8px",borderRadius:10,fontWeight:700,flexShrink:0,marginTop:2}}>{itx.type.toUpperCase()}</span>
+                        <span style={{fontSize:11,padding:"3px 8px",borderRadius:10,fontWeight:700,flexShrink:0,marginTop:2,
+                        background:{buy:"#F0FDF4",sell:"#FEF2F2",demerger_buy:"#EEF2FF",demerger_sell:"#F5F3FF",demerger_cost_reduce:"#FFF7ED"}[itx.type]||"#F1F5F9",
+                        color:{buy:"#10B981",sell:"#EF4444",demerger_buy:"#6366F1",demerger_sell:"#7C3AED",demerger_cost_reduce:"#D97706"}[itx.type]||"#64748B"}}>
+                        {(itx.type==="demerger_buy"?"DEMERGER IN":itx.type==="demerger_sell"?"DEMERGER OUT":itx.type==="demerger_cost_reduce"?"COST ADJ":itx.type==="buy"?"BUY":itx.type==="sell"?"SELL":itx.type.toUpperCase())}
+                      </span>
                         <div style={{flex:1,minWidth:0}}>
                           <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
                             <span style={{fontWeight:800,color:"#6366F1",fontSize:14}}>{itx.symbol||h?.symbol||"—"}</span>
@@ -4895,25 +5348,32 @@ function InvestmentsView({ state, dispatch }) {
                           </div>
                         </div>
                         <div style={{textAlign:"right",flexShrink:0}}>
-                          <div style={{fontWeight:800,fontSize:14,color:itx.type==="buy"?"#EF4444":"#10B981"}}>
-                            {itx.type==="buy"?"−":"+"}{fmtINR(toINR(total,cur,fxRates))}
+                          <div style={{fontWeight:800,fontSize:14,
+                            color:itx.invType==="demerger_virtual"?"#6366F1":itx.type==="buy"?"#EF4444":"#10B981"}}>
+                            {itx.invType==="demerger_virtual"?"⇄":itx.type==="buy"?"−":"+"}{fmtINR(toINR(total,cur,fxRates))}
                           </div>
                           <div style={{fontSize:10,color:"#94A3B8"}}>{cur!=="INR"?fmtCur(total,cur):""}</div>
                         </div>
                       </div>
-                      <div style={{display:"flex",gap:8,marginTop:10,marginLeft:26}}>
-                        <button onClick={()=>setEditHistoryTrade(itx)}
-                          style={{flex:1,fontSize:12,padding:"6px 0",borderRadius:8,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
-                          ✏️ Edit
-                        </button>
-                        <button onClick={()=>{
-                          if(!window.confirm("Delete this trade? Holdings and balances will be recalculated."))return;
-                          dispatch({type:"DELETE_INVESTMENT_TX",payload:itx.id});
-                          toast("Trade deleted — holdings recalculated");
-                        }} style={{flex:1,fontSize:12,padding:"6px 0",borderRadius:8,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
-                          🗑️ Delete
-                        </button>
-                      </div>
+                      {itx.invType==="demerger_virtual"?(
+                        <div style={{marginTop:8,marginLeft:26,fontSize:11,color:"#6366F1",background:"#EEF2FF",borderRadius:6,padding:"4px 8px",display:"inline-block"}}>
+                          🔒 Auto-generated by demerger · Delete the corporate action to remove
+                        </div>
+                      ):(
+                        <div style={{display:"flex",gap:8,marginTop:10,marginLeft:26}}>
+                          <button onClick={()=>setEditHistoryTrade(itx)}
+                            style={{flex:1,fontSize:12,padding:"6px 0",borderRadius:8,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+                            ✏️ Edit
+                          </button>
+                          <button onClick={()=>{
+                            if(!window.confirm("Delete this trade? Holdings and balances will be recalculated."))return;
+                            dispatch({type:"DELETE_INVESTMENT_TX",payload:itx.id});
+                            toast("Trade deleted — holdings recalculated");
+                          }} style={{flex:1,fontSize:12,padding:"6px 0",borderRadius:8,border:"1.5px solid #FECACA",background:"#FEF2F2",color:"#EF4444",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+                            🗑️ Delete
+                          </button>
+                        </div>
+                      )}
                     </Card>
                   );
                 })}
@@ -5522,9 +5982,11 @@ const NAV = [
 ];
 
 export default function App() {
-  const [user,        setUser]        = useState(null);
+  const [user,         setUser]        = useState(null);
+  // authLoading stays true until BOTH auth session AND initial cloud pull complete.
+  // This is a single boolean — no separate cloudLoading state that can get stuck.
   const [authLoading, setAuthLoading] = useState(true);
-  const [state,       dispatch]       = useReducer(reducer, undefined, loadLocal);
+  const [state,        dispatch]       = useReducer(reducer, undefined, loadLocal);
   const [view,        setView]        = useState(() => {
     try { return localStorage.getItem("wealthmap_view") || "dashboard"; } catch { return "dashboard"; }
   });
@@ -5539,77 +6001,93 @@ export default function App() {
   const toasts = useToastSystem();
 
   // Refs for stale-closure-free async ops
-  const syncTimer = useRef(null);
-  const userRef   = useRef(null);
-  const netRef    = useRef(true);
-  const stateRef  = useRef(state);
+  const syncTimer        = useRef(null);
+  const userRef          = useRef(null);
+  const netRef           = useRef(true);
+  const stateRef         = useRef(state);
+  const loadedForUserRef = useRef(null); // tracks which userId we already pulled cloud data for
   userRef.current  = user;
   netRef.current   = online;
   stateRef.current = state;
 
-  // ── Auth
+  // ── Auth — keep authLoading=true until we know the session state.
+  // Cloud pull happens in the separate [user] effect below; authLoading is only
+  // cleared there (for logged-in users) or here (for logged-out / no session).
   useEffect(()=>{
-    supabase.auth.getSession().then(({data})=>{setUser(data.session?.user||null);setAuthLoading(false);});
-    const {data:{subscription}} = supabase.auth.onAuthStateChange((_,session)=>setUser(session?.user||null));
+    supabase.auth.getSession().then(({data})=>{
+      const u = data.session?.user || null;
+      setUser(u);
+      if (!u) setAuthLoading(false); // no session → show auth screen immediately
+      // if u exists → authLoading stays true until cloud pull completes below
+    });
+    const {data:{subscription}} = supabase.auth.onAuthStateChange((_,session)=>{
+      setUser(session?.user || null);
+    });
     return ()=>subscription.unsubscribe();
   },[]);
 
-  // ── On login: pull cloud → cloud is source of truth ──────────────────────
-  // Cloud data always wins over local cache on login.
+  // ── On login: pull from cloud ONCE per user session ─────────────────────────
+  // Guard: loadedForUserRef tracks which userId we already pulled for.
+  // Supabase token refreshes fire onAuthStateChange with the same userId —
+  // the guard ignores them so switching tabs never triggers a reload.
+  // authLoading is cleared in the finally block — guaranteed no stuck screen.
   useEffect(()=>{
-    if (!user) return;
-    let cancelled=false;
+    if (!user) {
+      loadedForUserRef.current = null; // reset on logout
+      return;
+    }
+    if (loadedForUserRef.current === user.id) {
+      // Token refresh / tab focus — same user, nothing to do.
+      return;
+    }
+    loadedForUserRef.current = user.id;
+
     (async()=>{
       setSyncStatus("syncing");
       try {
-        const cloud = await pullCloud(user.id); // already sanitized + migrated
-        if (!cancelled) {
-          const cloudHasData = cloud && (
-            (cloud.accounts?.length > 0) ||
-            (cloud.transactions?.length > 0) ||
-            (cloud.investmentTx?.length > 0) ||
-            (cloud.holdings?.length > 0)
-          );
-          if (cloudHasData) {
-            // Cloud has data — it is the source of truth
-            console.log("[Cloud] Loaded from cloud:", cloud.investmentTx?.length ?? 0, "trades");
-            dispatch({ type:"SET", payload:cloud });
-            saveLocal(cloud); // update local cache
-          } else {
-            // Cloud is empty — push local state up to initialise the cloud record
-            const local = stateRef.current;
-            const localHasData = (local.accounts?.length > 0) || (local.transactions?.length > 0) || (local.investmentTx?.length > 0);
-            if (localHasData) {
-              console.log("[Cloud] Cloud empty — uploading local state with", local.investmentTx?.length ?? 0, "trades");
-              await pushCloud(user.id, local).catch(console.error);
-            }
+        const cloud = await pullCloud(user.id); // sanitized + deduped
+        if (cloud) {
+          console.log("[Cloud] Loaded from cloud:", cloud.investmentTx?.length ?? 0, "trades");
+          dispatch({ type:"SET", payload:cloud });
+          // Push deduped state back if cloud had duplicates
+          const cloudRaw     = await supabase.from("user_data").select("data").eq("id", user.id).maybeSingle();
+          const rawTxCount   = cloudRaw?.data?.data?.investmentTx?.length ?? 0;
+          const cleanTxCount = cloud.investmentTx?.length ?? 0;
+          if (rawTxCount !== cleanTxCount) {
+            console.log(`[Cloud] Pushing deduped state back (${rawTxCount} → ${cleanTxCount} trades)`);
+            await pushCloud(user.id, cloud).catch(console.error);
           }
+        } else {
+          console.log("[Cloud] No cloud data found — starting fresh.");
         }
-      } catch(e) { console.error("[Cloud] Login sync error:", e); }
-      if (!cancelled) setSyncStatus("synced");
+        setSyncStatus("synced");
+      } catch(e) {
+        console.error("[Cloud] Login sync error:", e);
+        setSyncStatus("error");
+      } finally {
+        // Always clear the loading screen — even if cloud fetch failed.
+        setAuthLoading(false);
+      }
     })();
-    return ()=>{ cancelled=true; };
+    // No cleanup cancellation needed: effect only runs once per userId.
   },[user]);
 
   // ── Online/offline
   useEffect(()=>{
-    const on=()=>{ setOnline(true); };
-    const off=()=>setOnline(false);
-    window.addEventListener("online",on); window.addEventListener("offline",off);
-    return ()=>{window.removeEventListener("online",on);window.removeEventListener("offline",off);};
+    const on  = () => setOnline(true);
+    const off = () => setOnline(false);
+    window.addEventListener("online", on);
+    window.addEventListener("offline", off);
+    return () => { window.removeEventListener("online", on); window.removeEventListener("offline", off); };
   },[]);
 
-  // ── Cloud-primary: every state change → save locally + push to cloud ───────
-  // localStorage = offline cache; Supabase = source of truth.
-  // No debounce — push immediately so data is never lost between sessions.
+  // ── Push every state change to cloud only (no localStorage writes) ─────────
   useEffect(()=>{
-    saveLocal(state); // always keep local cache fresh (for offline use)
     const u        = userRef.current;
     const isOnline = netRef.current;
-    if (!u || !isOnline) return; // offline: local cache already saved above
+    if (!u || !isOnline) return;
     setSyncStatus("syncing");
     clearTimeout(syncTimer.current);
-    // Small 400ms coalesce window to avoid flooding on rapid sequential dispatches
     syncTimer.current = setTimeout(async()=>{
       try {
         await pushCloud(u.id, stateRef.current);
@@ -5618,7 +6096,7 @@ export default function App() {
         console.error("[Cloud] Push error:", e);
         setSyncStatus("error");
       }
-    },1500);
+    }, 1500);
   },[state]);
 
   async function handleLogout() {
@@ -5665,7 +6143,8 @@ export default function App() {
     <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#F8FAFC"}}>
       <div style={{textAlign:"center"}}>
         <div style={{width:56,height:56,background:"linear-gradient(135deg,#6366F1,#8B5CF6)",borderRadius:16,display:"flex",alignItems:"center",justifyContent:"center",fontSize:28,margin:"0 auto 16px"}}>💎</div>
-        <div style={{color:"#64748B"}}>Loading…</div>
+        <div style={{color:"#6366F1",fontWeight:700,fontSize:15,marginBottom:6}}>WealthMap</div>
+        <div style={{color:"#64748B",fontSize:13}}>{user ? "Loading your data from cloud…" : "Loading…"}</div>
       </div>
     </div>
   );
