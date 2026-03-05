@@ -609,7 +609,7 @@ function calcNetWorth(accounts, transactions, fxRates, holdings, fixedDeposits, 
 
   // Build a set of category IDs that are investment-type
   // (category objects carry isInvestmentType:true, accounts do NOT)
-  const cats = accountCategories || DEFAULT.accountCategories;
+  const cats = accountCategories || (typeof DEFAULT !== "undefined" ? DEFAULT.accountCategories : []);
   const investmentCatIds = new Set(
     cats.filter(c => c.isInvestmentType).map(c => c.id)
   );
@@ -2632,6 +2632,7 @@ function DashboardView({ state }) {
   const fixedDeposits       = state?.fixedDeposits       ||[];
   const marketPrices        = state?.marketPrices        ||{};
   const tradeBalanceEffects = state?.tradeBalanceEffects ||[];
+  const accountCategories = state?.accountCategories || DEFAULT.accountCategories;
   const allCats      = [...(state?.expenseCategories||[]),...(state?.incomeCategories||[])];
   const [showNWBreakdown, setShowNWBreakdown] = useState(false);
 
@@ -2766,6 +2767,7 @@ function AccountsView({ state, dispatch }) {
 
   const accounts            = state?.accounts          ||[];
   const accCats             = state?.accountCategories  ||DEFAULT.accountCategories;
+  const accountCategories   = accCats; // alias used by calcNetWorth call below
   const transactions        = state?.transactions       ||[];
   const fxRates             = state?.fxRates            ||DEFAULT.fxRates;
   const holdings            = state?.holdings            ||[];
