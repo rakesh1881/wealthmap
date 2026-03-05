@@ -2658,6 +2658,7 @@ function DashboardView({ state }) {
   const fixedDeposits       = state?.fixedDeposits       ||[];
   const marketPrices        = state?.marketPrices        ||{};
   const tradeBalanceEffects = state?.tradeBalanceEffects ||[];
+  const accountCategories   = state?.accountCategories   ||DEFAULT.accountCategories;
   const allCats      = [...(state?.expenseCategories||[]),...(state?.incomeCategories||[])];
   const [showNWBreakdown, setShowNWBreakdown] = useState(false);
 
@@ -2798,6 +2799,7 @@ function AccountsView({ state, dispatch }) {
   const fixedDeposits       = state?.fixedDeposits       ||[];
   const marketPrices        = state?.marketPrices        ||{};
   const tradeBalanceEffects = state?.tradeBalanceEffects ||[];
+  const accountCategories   = state?.accountCategories   ||DEFAULT.accountCategories;
   const byCategory          = accCats.map(cat=>({...cat,accounts:accounts.filter(a=>a.categoryId===cat.id)}));
 
   function toggleDisable(acc, shouldDisable) {
