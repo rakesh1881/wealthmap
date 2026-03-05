@@ -1,12 +1,11 @@
 // ============================================================
-// WEALTHMAP v16 — Investment Data Migration Layer
-// Changes vs v15:
-//  1.  migrateFromOlderVersion() scans wealthmap_v1..v14 + bare keys on every load
-//  2.  Maps all legacy field names → current investmentTx / holdings / tradeBalanceEffects
-//  3.  Runs rebuildHoldings + buildTradeBalanceEffects after migration
-//  4.  Merges migrated trades into existing v15 state (additive — never deletes)
-//  5.  Marks migrated keys with __migrated_to flag so migration runs only once
-//  6.  Full console logging of migration steps
+// WEALTHMAP v17 — Net Worth Double-Count Fix + Persistence Fix
+// Changes vs v16:
+//  1.  cat_broker + cat_mf + cat_invest ALL excluded from net worth account-balance sum
+//      (previously only cat_invest was marked isInvestmentType — broker accounts double-counted)
+//  2.  Migration only runs when current state has zero investmentTx (prevents re-import loop)
+//  3.  Migration dedup uses externalTradeId as primary key (matches Zerodha trade_id)
+//  4.  All three investment category types flagged isInvestmentType:true in DEFAULT
 // Changes vs v11:
 //  1.  FD Close: Undo support (FD marked closed, not deleted)
 //  2.  Profits tab: summary per stock only (no individual trade rows)
@@ -23,7 +22,7 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = "https://hqkqhgrfcwixqoehjfaj.supabase.co";
 const SUPABASE_KEY = "sb_publishable_N-ZcUkVL6fF-pch1sZPg6Q_hbd8sUPv";
 const supabase     = createClient(SUPABASE_URL, SUPABASE_KEY);
-const STORAGE_KEY  = "wealthmap_v16";
+const STORAGE_KEY  = "wealthmap_v17";
 
 // ─── CURRENCIES ───────────────────────────────────────────────────────────────
 const CURRENCIES = [
@@ -54,8 +53,8 @@ const DEFAULT = {
     { id:"cat_cash",   name:"Cash",         icon:"💵", color:"#10B981", isCreditCardType:false },
     { id:"cat_cc",     name:"Credit Card",  icon:"💳", color:"#EF4444", isCreditCardType:true  },
     { id:"cat_wallet", name:"Wallet / UPI", icon:"📱", color:"#F59E0B", isCreditCardType:false },
-    { id:"cat_broker", name:"Stock Broker", icon:"📈", color:"#8B5CF6", isCreditCardType:false },
-    { id:"cat_mf",     name:"Mutual Funds", icon:"📊", color:"#06B6D4", isCreditCardType:false },
+    { id:"cat_broker", name:"Stock Broker", icon:"📈", color:"#8B5CF6", isCreditCardType:false, isInvestmentType:true },
+    { id:"cat_mf",     name:"Mutual Funds", icon:"📊", color:"#06B6D4", isCreditCardType:false, isInvestmentType:true },
     { id:"cat_invest",  name:"Investment",   icon:"📈", color:"#6366F1", isCreditCardType:false, isInvestmentType:true },
     { id:"cat_other",   name:"Other",        icon:"🏷️", color:"#6B7280", isCreditCardType:false },
   ],
@@ -128,12 +127,25 @@ function sanitizeAccount(a) {
   return out;
 }
 
+// Known investment-type category IDs (built-in + legacy aliases)
+const INVESTMENT_CAT_IDS = new Set(["cat_invest", "cat_broker", "cat_mf"]);
+
+// Ensure stored category objects carry the correct flags
+// (old stored data may be missing isInvestmentType on cat_broker / cat_mf)
+function sanitizeAccountCategory(c) {
+  if (!c || typeof c !== "object") return c;
+  if (INVESTMENT_CAT_IDS.has(c.id)) {
+    return { ...c, isInvestmentType: true };
+  }
+  return c;
+}
+
 function sanitize(raw) {
   if (!raw || typeof raw !== "object") return { ...DEFAULT };
   return {
     accounts:            Array.isArray(raw.accounts)            ? raw.accounts.map(sanitizeAccount) : [],
-    accountCategories:   Array.isArray(raw.accountCategories)   ? raw.accountCategories
-                       : Array.isArray(raw.categories)          ? raw.categories : DEFAULT.accountCategories,
+    accountCategories:   Array.isArray(raw.accountCategories)   ? raw.accountCategories.map(sanitizeAccountCategory)
+                       : Array.isArray(raw.categories)          ? raw.categories.map(sanitizeAccountCategory) : DEFAULT.accountCategories,
     expenseCategories:   Array.isArray(raw.expenseCategories)   ? raw.expenseCategories  : DEFAULT.expenseCategories,
     incomeCategories:    Array.isArray(raw.incomeCategories)     ? raw.incomeCategories   : DEFAULT.incomeCategories,
     transactions:        Array.isArray(raw.transactions)         ? raw.transactions        : [],
@@ -207,7 +219,7 @@ const ALL_LEGACY_KEYS = [
   "wealthmap_v1",  "wealthmap_v2",  "wealthmap_v3",  "wealthmap_v4",
   "wealthmap_v5",  "wealthmap_v6",  "wealthmap_v7",  "wealthmap_v8",
   "wealthmap_v9",  "wealthmap_v10", "wealthmap_v11", "wealthmap_v12",
-  "wealthmap_v13", "wealthmap_v14", "wealthmap_v15",
+  "wealthmap_v13", "wealthmap_v14", "wealthmap_v15", "wealthmap_v16",
   // Current key is excluded (handled by loadLocal directly)
 ];
 
@@ -312,7 +324,19 @@ function extractLegacyTrades(raw, fallbackAccountId) {
 
 // Main migration function — called once at startup inside loadLocal.
 // Returns the merged, migrated state to use as the initial app state.
+//
+// IMPORTANT: Migration only runs when currentState has NO investmentTx.
+// If the user has already imported data into the current version, we trust
+// that data completely and skip migration to avoid duplication loops.
 function migrateFromOlderVersion(currentState) {
+  // ── Guard: if current state already has investment data, skip entirely ─────
+  // This prevents re-running migration on every reload after the first import.
+  const currentTxCount = (currentState.investmentTx || []).length;
+  if (currentTxCount > 0) {
+    console.log("[Migration] Current state has", currentTxCount, "trade(s) — skipping migration.");
+    return currentState;
+  }
+
   let migratedTxs   = [];
   let sourceKeyUsed = null;
 
@@ -366,18 +390,26 @@ function migrateFromOlderVersion(currentState) {
   }
 
   // ── Merge migrated trades with any existing trades in current state ──────
-  const existingIds = new Set(
-    (currentState.investmentTx || []).map(t => t.id)
-  );
-  const existingExtIds = new Set(
-    (currentState.investmentTx || [])
-      .filter(t => t.externalTradeId)
-      .map(t => String(t.externalTradeId))
-  );
+  // Since migration only runs when currentState.investmentTx is empty (guard above),
+  // this merge is only reached on a true cold-start migration (no existing trades).
+  // Dedup is still applied within the migrated batch itself.
+  const seenIds    = new Set();
+  const seenExtIds = new Set();
+  const seenFP     = new Set(); // content fingerprint: type|date|symbol|qty|price
 
   const newTxs = migratedTxs.filter(t => {
-    if (existingIds.has(t.id)) return false;                          // exact ID match
-    if (t.externalTradeId && existingExtIds.has(t.externalTradeId)) return false; // ext ID match
+    // Intra-batch dedup by exact ID
+    if (seenIds.has(t.id)) return false;
+    seenIds.add(t.id);
+    // Intra-batch dedup by external trade_id (Zerodha trade_id etc.)
+    if (t.externalTradeId) {
+      if (seenExtIds.has(String(t.externalTradeId))) return false;
+      seenExtIds.add(String(t.externalTradeId));
+    }
+    // Intra-batch dedup by content fingerprint
+    const fp = t.type + "|" + t.date + "|" + t.symbol + "|" + t.quantity + "|" + t.price;
+    if (seenFP.has(fp)) return false;
+    seenFP.add(fp);
     return true;
   });
 
@@ -1880,9 +1912,21 @@ function AccountModal({ state, onClose, onSave, editAcc }) {
   const [inclNW,        setInclNW]        = useState(editAcc?.includeInNetWorth ?? true);
   const [showCCSettings,setShowCCSettings]= useState(false);
 
-  // Determine if this account is CC type based on category's isCreditCardType flag
+  // Determine if this account is CC or Investment type based on category flags
   const selCat    = cats.find(c => c.id===catId);
   const isCCCat   = !!selCat?.isCreditCardType;
+  const isInvCat  = !!selCat?.isInvestmentType;
+
+  // When category changes, auto-update include_in_networth:
+  //  - Investment/Broker/MF categories → false (value tracked via holdings)
+  //  - CC categories → true (payable balance deducted)
+  //  - Others → keep current value
+  function handleCatChange(newCatId) {
+    setCatId(newCatId);
+    const cat = cats.find(c => c.id === newCatId);
+    if (cat?.isInvestmentType) setInclNW(false);
+    else if (!cat?.isCreditCardType) setInclNW(true);
+  }
 
   function save(ccOverrides={}) {
     if (!name.trim()) return;
@@ -1914,7 +1958,7 @@ function AccountModal({ state, onClose, onSave, editAcc }) {
   return (
     <>
       <Modal title={isEdit?"Edit Account":"Add Account"} onClose={onClose}>
-        <Sel label="Account Type" value={catId} onChange={e=>setCatId(e.target.value)}>
+        <Sel label="Account Type" value={catId} onChange={e=>handleCatChange(e.target.value)}>
           {cats.map(c=><option key={c.id} value={c.id}>{c.icon} {c.name}</option>)}
         </Sel>
         <Inp label="Account Name" value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. SBI Savings, Zerodha…" />
@@ -1924,7 +1968,11 @@ function AccountModal({ state, onClose, onSave, editAcc }) {
         <Inp label={`Opening Balance (${cur})`} type="number" value={opening}
              onChange={e=>setOpening(e.target.value)} placeholder="0.00" />
         <Toggle label="Include in Net Worth?" checked={inclNW} onChange={setInclNW}
-                note={isCCCat ? "CC payable balance will be deducted from net worth" : "Asset balance counted toward net worth"} />
+                note={
+                  isCCCat  ? "CC payable balance will be deducted from net worth" :
+                  isInvCat ? "Investment accounts are excluded — value tracked via holdings" :
+                             "Asset balance counted toward net worth"
+                } />
         <Field label="Icon">
           <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
             {icons.map(ic=>(
