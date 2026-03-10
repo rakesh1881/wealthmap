@@ -1,5 +1,5 @@
 // ============================================================
-// WEALTHMAP v30 — Fix: opening_balance persisted to wm_accounts SQL column, survives refresh
+// WEALTHMAP v31 — Accounts: show total per account type group
 // Changes vs v16:
 //  1.  Cloud-primary: Supabase is the source of truth, not localStorage
 //  2.  On login: always pull from cloud first; localStorage is only offline cache
@@ -23,7 +23,7 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = "https://hqkqhgrfcwixqoehjfaj.supabase.co";
 const SUPABASE_KEY = "sb_publishable_N-ZcUkVL6fF-pch1sZPg6Q_hbd8sUPv";
 const supabase     = createClient(SUPABASE_URL, SUPABASE_KEY);
-const STORAGE_KEY  = "wealthmap_v30";
+const STORAGE_KEY  = "wealthmap_v31";
 
 // ─── CURRENCIES ───────────────────────────────────────────────────────────────
 const CURRENCIES = [
@@ -3537,6 +3537,24 @@ function AccountsView({ state, dispatch }) {
               />
             ))}
           </div>
+          {/* Category total — sum of all account balances in this group */}
+          {cat.accounts.length > 1 && (() => {
+            const catTotal = cat.accounts.reduce((sum, acc) => {
+              const bal = calcBalance(acc.id, transactions, accounts, tradeBalanceEffects);
+              return sum + toINR(bal, acc.currency || "INR", fxRates);
+            }, 0);
+            return (
+              <div style={{display:"flex",justifyContent:"flex-end",alignItems:"center",gap:8,
+                marginTop:8,paddingTop:8,borderTop:"1.5px dashed #E2E8F0"}}>
+                <span style={{fontSize:12,color:"#94A3B8",fontWeight:600,textTransform:"uppercase",letterSpacing:"0.05em"}}>
+                  {cat.name} Total
+                </span>
+                <span style={{fontSize:15,fontWeight:800,color:catTotal>=0?"#0F172A":"#EF4444"}}>
+                  {fmtINR(catTotal)}
+                </span>
+              </div>
+            );
+          })()}
         </div>
       ))}
 
