@@ -1,5 +1,5 @@
 // ============================================================
-// WEALTHMAP v29 — Fix: net worth doubling when broker/MF accounts not excluded from balance calc
+// WEALTHMAP v30 — Fix: opening_balance persisted to wm_accounts SQL column, survives refresh
 // Changes vs v16:
 //  1.  Cloud-primary: Supabase is the source of truth, not localStorage
 //  2.  On login: always pull from cloud first; localStorage is only offline cache
@@ -23,7 +23,7 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = "https://hqkqhgrfcwixqoehjfaj.supabase.co";
 const SUPABASE_KEY = "sb_publishable_N-ZcUkVL6fF-pch1sZPg6Q_hbd8sUPv";
 const supabase     = createClient(SUPABASE_URL, SUPABASE_KEY);
-const STORAGE_KEY  = "wealthmap_v29";
+const STORAGE_KEY  = "wealthmap_v30";
 
 // ─── CURRENCIES ───────────────────────────────────────────────────────────────
 const CURRENCIES = [
@@ -500,6 +500,7 @@ function rowToAccount(r) {
     color:               r.color || "#6366F1",
     icon:                r.icon || "🏦",
     note:                r.note || "",
+    openingBalance:      parseFloat(r.opening_balance) || 0,
     credit_limit:        r.credit_limit != null ? parseFloat(r.credit_limit) : undefined,
     due_date:            r.due_date     != null ? parseInt(r.due_date)       : undefined,
   };
@@ -645,6 +646,7 @@ function accountToRow(a, uid) {
     color:               a.color || "#6366F1",
     icon:                a.icon  || "🏦",
     note:                a.note  || "",
+    opening_balance:     parseFloat(a.openingBalance) || 0,
     credit_limit:        a.credit_limit != null ? parseFloat(a.credit_limit) : null,
     due_date:            a.due_date     != null ? parseInt(a.due_date)       : null,
   };
