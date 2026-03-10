@@ -1,5 +1,5 @@
 // ============================================================
-// WEALTHMAP v24 — Demerger via virtual investmentTx: holdings always rebuilt from ledger, zero-qty auto-removed
+// WEALTHMAP v29 — Fix: net worth doubling when broker/MF accounts not excluded from balance calc
 // Changes vs v16:
 //  1.  Cloud-primary: Supabase is the source of truth, not localStorage
 //  2.  On login: always pull from cloud first; localStorage is only offline cache
@@ -23,7 +23,7 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = "https://hqkqhgrfcwixqoehjfaj.supabase.co";
 const SUPABASE_KEY = "sb_publishable_N-ZcUkVL6fF-pch1sZPg6Q_hbd8sUPv";
 const supabase     = createClient(SUPABASE_URL, SUPABASE_KEY);
-const STORAGE_KEY  = "wealthmap_v24";
+const STORAGE_KEY  = "wealthmap_v29";
 
 // ─── CURRENCIES ───────────────────────────────────────────────────────────────
 const CURRENCIES = [
@@ -54,8 +54,8 @@ const DEFAULT = {
     { id:"cat_cash",   name:"Cash",         icon:"💵", color:"#10B981", isCreditCardType:false },
     { id:"cat_cc",     name:"Credit Card",  icon:"💳", color:"#EF4444", isCreditCardType:true  },
     { id:"cat_wallet", name:"Wallet / UPI", icon:"📱", color:"#F59E0B", isCreditCardType:false },
-    { id:"cat_broker", name:"Stock Broker", icon:"📈", color:"#8B5CF6", isCreditCardType:false },
-    { id:"cat_mf",     name:"Mutual Funds", icon:"📊", color:"#06B6D4", isCreditCardType:false },
+    { id:"cat_broker", name:"Stock Broker", icon:"📈", color:"#8B5CF6", isCreditCardType:false, isInvestmentType:true },
+    { id:"cat_mf",     name:"Mutual Funds", icon:"📊", color:"#06B6D4", isCreditCardType:false, isInvestmentType:true },
     { id:"cat_invest",  name:"Investment",   icon:"📈", color:"#6366F1", isCreditCardType:false, isInvestmentType:true },
     { id:"cat_other",   name:"Other",        icon:"🏷️", color:"#6B7280", isCreditCardType:false },
   ],
@@ -132,8 +132,14 @@ function sanitize(raw) {
   if (!raw || typeof raw !== "object") return { ...DEFAULT };
   return {
     accounts:            Array.isArray(raw.accounts)            ? raw.accounts.map(sanitizeAccount) : [],
-    accountCategories:   Array.isArray(raw.accountCategories)   ? raw.accountCategories
-                       : Array.isArray(raw.categories)          ? raw.categories : DEFAULT.accountCategories,
+    accountCategories:   (() => {
+                           const knownInv = new Set(["cat_broker","cat_mf","cat_invest"]);
+                           const cats = Array.isArray(raw.accountCategories) ? raw.accountCategories
+                                      : Array.isArray(raw.categories)        ? raw.categories
+                                      : DEFAULT.accountCategories;
+                           // Backfill isInvestmentType for known IDs in case old data lacked the flag
+                           return cats.map(c => knownInv.has(c.id) ? {...c, isInvestmentType:true} : c);
+                         })(),
     expenseCategories:   Array.isArray(raw.expenseCategories)   ? raw.expenseCategories  : DEFAULT.expenseCategories,
     incomeCategories:    Array.isArray(raw.incomeCategories)     ? raw.incomeCategories   : DEFAULT.incomeCategories,
     transactions:        Array.isArray(raw.transactions)         ? raw.transactions        : [],
@@ -467,39 +473,488 @@ function migrateFromOlderVersion(currentState) {
   return mergedState;
 }
 
-// ─── CLOUD ────────────────────────────────────────────────────────────────────
-// pushCloud: upsert full state to Supabase user_data table.
-// Called on every state change (cloud-primary writes).
-async function pushCloud(userId, s) {
-  if (!userId || !s) return;
-  const { error } = await supabase.from("user_data").upsert(
-    { id: userId, data: s, updated_at: new Date().toISOString() },
-    { onConflict: "id" }
-  );
-  if (error) {
-    console.error("[Cloud] Push failed:", error.message);
-    throw error;
-  }
+// ─── FULLY NORMALIZED DB LAYER ───────────────────────────────────────────────
+//
+// All 13 tables use real typed columns. Zero JSON blobs for user data.
+// Only two jsonb fields remain (both justified):
+//   wm_corporate_actions.result_stocks — variable-length array of sub-objects
+//   wm_holdings.lots                   — ordered FIFO lot array [{qty,price,date,txId}]
+//
+// Table → App object mappers (rowTo*) and reverse (appTo*Row)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── DB row → App object ───────────────────────────────────────────────────────
+
+function rowToAccount(r) {
+  return {
+    id:                  r.id,
+    name:                r.name || "",
+    account_type:        r.account_type || "other",
+    categoryId:          r.account_type || "other",
+    balance:             parseFloat(r.balance) || 0,
+    currency:            r.currency || "INR",
+    is_active:           r.is_active !== false,
+    disabled:            r.is_active === false,
+    include_in_networth: r.include_in_networth !== false,
+    includeInNetWorth:   r.include_in_networth !== false,
+    color:               r.color || "#6366F1",
+    icon:                r.icon || "🏦",
+    note:                r.note || "",
+    credit_limit:        r.credit_limit != null ? parseFloat(r.credit_limit) : undefined,
+    due_date:            r.due_date     != null ? parseInt(r.due_date)       : undefined,
+  };
 }
 
-// pullCloud: fetch latest state from Supabase.
-// Runs deduplication on every pull to fix any doubles that snuck into the cloud.
+function rowToTx(r) {
+  return {
+    id:             r.id,
+    type:           r.type,
+    amount:         parseFloat(r.amount) || 0,
+    currency:       r.currency || "INR",
+    date:           r.date ? String(r.date).slice(0,10) : "",
+    categoryId:     r.category_id || "",
+    accountId:      r.account_id  || "",
+    fromAccountId:  r.from_account_id || "",
+    toAccountId:    r.to_account_id   || "",
+    note:           r.note || "",
+    refundedAmount: parseFloat(r.refunded_amount) || 0,
+    isRefunded:     r.is_refunded || false,
+  };
+}
+
+function rowToInvestmentTx(r) {
+  return {
+    id:              r.id,
+    type:            r.type,
+    invType:         r.inv_type || "stock",
+    symbol:          r.symbol || "",
+    name:            r.name || "",
+    quantity:        parseFloat(r.quantity) || 0,
+    price:           parseFloat(r.price) || 0,
+    currency:        r.currency || "INR",
+    date:            r.date ? String(r.date).slice(0,10) : "",
+    accountId:       r.account_id        || "",
+    sourceAccountId: r.source_account_id || "",
+    holdingId:       r.holding_id        || "",
+    brokerage:       parseFloat(r.brokerage) || 0,
+    note:            r.note || "",
+    externalTradeId: r.external_trade_id || "",
+    demergerCaId:    r.demerger_ca_id    || undefined,
+  };
+}
+
+function rowToFD(r) {
+  return {
+    id:              r.id,
+    bankName:        r.bank_name || "",
+    amount:          parseFloat(r.amount) || 0,
+    interestRate:    parseFloat(r.interest_rate) || 0,
+    investedDate:    r.start_date     ? String(r.start_date).slice(0,10)    : "",
+    maturityDate:    r.maturity_date  ? String(r.maturity_date).slice(0,10) : "",
+    accountId:       r.account_id        || "",
+    sourceAccountId: r.source_account_id || "",
+    currency:        r.currency || "INR",
+    note:            r.note || "",
+    isActive:        r.is_active !== false,
+    invType:         "fd",
+  };
+}
+
+function rowToStock(r) {
+  return { id: r.id, symbol: r.symbol||"", name: r.name||"", type: r.type||"stock", exchange: r.exchange||"" };
+}
+
+function rowToCorporateAction(r) {
+  return {
+    id:             r.id,
+    symbol:         r.symbol || "",
+    action_type:    r.action_type || "",
+    date:           r.date ? String(r.date).slice(0,10) : "",
+    ratio:          r.ratio           != null ? parseFloat(r.ratio)           : undefined,
+    record_date:    r.record_date     ? String(r.record_date).slice(0,10)     : undefined,
+    new_symbol:     r.new_symbol      || undefined,
+    new_name:       r.new_name        || undefined,
+    old_name:       r.old_name        || undefined,
+    to_symbol:      r.to_symbol       || undefined,
+    amount:         r.amount          != null ? parseFloat(r.amount)          : undefined,
+    eligible_shares:r.eligible_shares != null ? parseFloat(r.eligible_shares) : undefined,
+    eligible_cost:  r.eligible_cost   != null ? parseFloat(r.eligible_cost)   : undefined,
+    demerger_type:  r.demerger_type   || undefined,
+    result_stocks:  Array.isArray(r.result_stocks) ? r.result_stocks : [],
+    note:           r.note || "",
+  };
+}
+
+function rowToHolding(r) {
+  return {
+    id:             r.id,
+    symbol:         r.symbol || "",
+    name:           r.name   || "",
+    type:           r.type   || "stock",
+    accountId:      r.account_id || "",
+    currency:       r.currency   || "INR",
+    quantity:       parseFloat(r.quantity)        || 0,
+    units:          parseFloat(r.units)           || 0,
+    avgPrice:       parseFloat(r.avg_price)       || 0,
+    nav:            parseFloat(r.nav)             || 0,
+    investedAmount: parseFloat(r.invested_amount) || 0,
+    lots:           Array.isArray(r.lots) ? r.lots : [],
+  };
+}
+
+function rowToBalanceEffect(r) {
+  return {
+    id:        r.id,
+    accountId: r.account_id || "",
+    amount:    parseFloat(r.amount) || 0,
+    sign:      parseInt(r.sign) || 1,
+    tradeId:   r.trade_id || "",
+    date:      r.date ? String(r.date).slice(0,10) : "",
+    isFD:      r.is_fd || false,
+  };
+}
+
+function rowToAccountCategory(r) {
+  // Force isInvestmentType for broker/mf/invest categories regardless of what's in DB
+  // (old rows were saved without this flag, so we derive it from the known IDs)
+  const knownInvestmentCatIds = new Set(["cat_broker", "cat_mf", "cat_invest"]);
+  const isInvestmentType = r.is_investment_type || knownInvestmentCatIds.has(r.id);
+  return {
+    id:               r.id,
+    name:             r.name  || "",
+    icon:             r.icon  || "",
+    color:            r.color || "#6B7280",
+    isCreditCardType: r.is_credit_card || false,
+    isInvestmentType,
+  };
+}
+function rowToExpenseCategory(r) { return { id: r.id, name: r.name||"", icon: r.icon||"" }; }
+function rowToIncomeCategory(r)  { return { id: r.id, name: r.name||"", icon: r.icon||"" }; }
+
+// ── App object → DB row ───────────────────────────────────────────────────────
+
+function accountToRow(a, uid) {
+  return {
+    id: a.id, user_id: uid,
+    name:                a.name || "",
+    account_type:        a.account_type || a.categoryId || "other",
+    balance:             parseFloat(a.balance) || 0,
+    currency:            a.currency || "INR",
+    is_active:           a.is_active !== false && a.disabled !== true,
+    include_in_networth: a.include_in_networth !== false && a.includeInNetWorth !== false,
+    color:               a.color || "#6366F1",
+    icon:                a.icon  || "🏦",
+    note:                a.note  || "",
+    credit_limit:        a.credit_limit != null ? parseFloat(a.credit_limit) : null,
+    due_date:            a.due_date     != null ? parseInt(a.due_date)       : null,
+  };
+}
+
+function txToRow(t, uid) {
+  return {
+    id: t.id, user_id: uid,
+    type:            t.type || "expense",
+    amount:          parseFloat(t.amount) || 0,
+    currency:        t.currency || "INR",
+    date:            t.date || new Date().toISOString().slice(0,10),
+    category_id:     t.categoryId     || null,
+    account_id:      t.accountId      || null,
+    from_account_id: t.fromAccountId  || null,
+    to_account_id:   t.toAccountId    || null,
+    note:            t.note || "",
+    refunded_amount: parseFloat(t.refundedAmount) || 0,
+    is_refunded:     t.isRefunded || false,
+  };
+}
+
+function investmentTxToRow(itx, uid) {
+  return {
+    id: itx.id, user_id: uid,
+    type:              itx.type    || "buy",
+    inv_type:          itx.invType || "stock",
+    symbol:            itx.symbol  || "",
+    name:              itx.name    || "",
+    quantity:          parseFloat(itx.quantity)  || 0,
+    price:             parseFloat(itx.price)     || 0,
+    currency:          itx.currency || "INR",
+    date:              itx.date || new Date().toISOString().slice(0,10),
+    account_id:        itx.accountId        || null,
+    source_account_id: itx.sourceAccountId  || null,
+    holding_id:        itx.holdingId        || null,
+    brokerage:         parseFloat(itx.brokerage) || 0,
+    note:              itx.note             || "",
+    external_trade_id: itx.externalTradeId  || null,
+    demerger_ca_id:    itx.demergerCaId     || null,
+  };
+}
+
+function fdToRow(fd, uid) {
+  return {
+    id: fd.id, user_id: uid,
+    bank_name:         fd.bankName  || "",
+    amount:            parseFloat(fd.amount)       || 0,
+    interest_rate:     parseFloat(fd.interestRate) || 0,
+    start_date:        fd.investedDate  || null,
+    maturity_date:     fd.maturityDate  || null,
+    account_id:        fd.accountId        || null,
+    source_account_id: fd.sourceAccountId  || null,
+    currency:          fd.currency || "INR",
+    note:              fd.note     || "",
+    is_active:         fd.isActive !== false,
+  };
+}
+
+function stockToRow(s, uid) {
+  return { id: s.id, user_id: uid, symbol: s.symbol||"", name: s.name||"", type: s.type||"stock", exchange: s.exchange||"" };
+}
+
+function corporateActionToRow(ca, uid) {
+  return {
+    id: ca.id, user_id: uid,
+    symbol:          ca.symbol      || "",
+    action_type:     ca.action_type || "",
+    date:            ca.date || new Date().toISOString().slice(0,10),
+    ratio:           ca.ratio           != null ? parseFloat(ca.ratio)           : null,
+    record_date:     ca.record_date     || null,
+    new_symbol:      ca.new_symbol      || null,
+    new_name:        ca.new_name        || null,
+    old_name:        ca.old_name        || null,
+    to_symbol:       ca.to_symbol       || null,
+    amount:          ca.amount          != null ? parseFloat(ca.amount)          : null,
+    eligible_shares: ca.eligible_shares != null ? parseFloat(ca.eligible_shares) : null,
+    eligible_cost:   ca.eligible_cost   != null ? parseFloat(ca.eligible_cost)   : null,
+    demerger_type:   ca.demerger_type   || null,
+    result_stocks:   ca.result_stocks   || [],
+    note:            ca.note || "",
+  };
+}
+
+function holdingToRow(h, uid) {
+  return {
+    id: h.id, user_id: uid,
+    symbol:          h.symbol   || "",
+    name:            h.name     || "",
+    type:            h.type     || "stock",
+    account_id:      h.accountId || null,
+    currency:        h.currency  || "INR",
+    quantity:        parseFloat(h.quantity)        || 0,
+    units:           parseFloat(h.units)           || 0,
+    avg_price:       parseFloat(h.avgPrice)        || 0,
+    nav:             parseFloat(h.nav)             || 0,
+    invested_amount: parseFloat(h.investedAmount)  || 0,
+    lots:            h.lots || [],
+  };
+}
+
+function balanceEffectToRow(e, uid) {
+  return {
+    id: e.id, user_id: uid,
+    account_id: e.accountId || "",
+    amount:     parseFloat(e.amount) || 0,
+    sign:       parseInt(e.sign) || 1,
+    trade_id:   e.tradeId || null,
+    date:       e.date    || null,
+    is_fd:      e.isFD    || false,
+  };
+}
+
+function accountCategoryToRow(c, uid) {
+  const knownInvestmentCatIds = new Set(["cat_broker", "cat_mf", "cat_invest"]);
+  return {
+    id: c.id, user_id: uid,
+    name:               c.name  || "",
+    icon:               c.icon  || "",
+    color:              c.color || "#6B7280",
+    is_credit_card:     c.isCreditCardType || false,
+    is_investment_type: c.isInvestmentType || knownInvestmentCatIds.has(c.id),
+  };
+}
+function expenseCategoryToRow(c, uid) { return { id: c.id, user_id: uid, name: c.name||"", icon: c.icon||"" }; }
+function incomeCategoryToRow(c, uid)  { return { id: c.id, user_id: uid, name: c.name||"", icon: c.icon||"" }; }
+
+// ── Generic DB helpers ────────────────────────────────────────────────────────
+
+async function dbFetch(table, userId, mapFn) {
+  try {
+    const { data, error } = await supabase.from(table).select("*").eq("user_id", userId);
+    if (error) { console.warn(`[DB] fetch ${table}:`, error.message); return []; }
+    return (data || []).map(mapFn);
+  } catch(e) { console.warn(`[DB] fetch ${table}:`, e); return []; }
+}
+
+async function dbUpsert(table, rows) {
+  if (!rows || rows.length === 0) return;
+  const { error } = await supabase.from(table).upsert(rows, { onConflict: "id,user_id" });
+  if (error) console.error(`[DB] upsert ${table}:`, error.message);
+}
+
+async function dbDelete(table, userId, ids) {
+  if (!ids || ids.length === 0) return;
+  const { error } = await supabase.from(table).delete().eq("user_id", userId).in("id", ids);
+  if (error) console.error(`[DB] delete ${table}:`, error.message);
+}
+
+// ── pullCloud: fetch all 13 tables in parallel ────────────────────────────────
 async function pullCloud(userId) {
   if (!userId) return null;
   try {
-    const { data, error } = await supabase.from("user_data")
-      .select("data").eq("id", userId).maybeSingle();
-    if (error) { console.warn("[Cloud] Pull error:", error.message); return null; }
-    if (!data?.data) return null;
-    const sanitized  = sanitize(data.data);
-    const deduped    = deduplicateState(sanitized);
-    return deduped;
+    const [
+      accounts, accountCategories, expenseCategories, incomeCategories,
+      transactions, investmentTx, fixedDeposits, stocks, corporateActions,
+      holdings, balanceEffects,
+      mpRows, fxRows,
+    ] = await Promise.all([
+      dbFetch("wm_accounts",              userId, rowToAccount),
+      dbFetch("wm_account_categories",    userId, rowToAccountCategory),
+      dbFetch("wm_expense_categories",    userId, rowToExpenseCategory),
+      dbFetch("wm_income_categories",     userId, rowToIncomeCategory),
+      dbFetch("wm_transactions",          userId, rowToTx),
+      dbFetch("wm_investment_tx",         userId, rowToInvestmentTx),
+      dbFetch("wm_fixed_deposits",        userId, rowToFD),
+      dbFetch("wm_stocks",                userId, rowToStock),
+      dbFetch("wm_corporate_actions",     userId, rowToCorporateAction),
+      dbFetch("wm_holdings",              userId, rowToHolding),
+      dbFetch("wm_trade_balance_effects", userId, rowToBalanceEffect),
+      supabase.from("wm_market_prices").select("symbol,current_price,last_updated").eq("user_id", userId),
+      supabase.from("wm_fx_rates").select("currency,rate").eq("user_id", userId),
+    ]);
+
+    // Assemble marketPrices { symbol: {current_price, last_updated} }
+    const marketPrices = {};
+    (mpRows.data || []).forEach(r => {
+      marketPrices[r.symbol] = { current_price: parseFloat(r.current_price)||0, last_updated: r.last_updated };
+    });
+
+    // Assemble fxRates { currency: rate }
+    const fxRates = { ...DEFAULT.fxRates };
+    (fxRows.data || []).forEach(r => { fxRates[r.currency] = parseFloat(r.rate) || 1; });
+
+    const hasData = accounts.length > 0 || investmentTx.length > 0 ||
+                    transactions.length > 0 || fixedDeposits.length > 0;
+
+    if (!hasData) {
+      const migrated = await migrateFromLegacyBlob(userId);
+      if (migrated) return migrated;
+      console.log("[DB] No data — fresh start.");
+      return null;
+    }
+
+    const assembled = {
+      accounts,
+      accountCategories:   accountCategories.length > 0 ? accountCategories : DEFAULT.accountCategories,
+      expenseCategories:   expenseCategories.length > 0 ? expenseCategories : DEFAULT.expenseCategories,
+      incomeCategories:    incomeCategories.length  > 0 ? incomeCategories  : DEFAULT.incomeCategories,
+      transactions,
+      investmentTx,
+      fixedDeposits,
+      stocks,
+      corporateActions,
+      holdings,
+      tradeBalanceEffects: balanceEffects,
+      marketPrices,
+      fxRates,
+    };
+
+    console.log("[DB] Loaded:", investmentTx.length, "trades,", accounts.length,
+      "accounts,", corporateActions.length, "corporate actions,", holdings.length, "holdings");
+    return deduplicateState(sanitize(assembled));
+
   } catch(e) {
-    console.warn("[Cloud] Pull exception:", e);
+    console.error("[DB] pullCloud exception:", e);
     return null;
   }
 }
 
+// ── pushCloud: diff and write only changed rows ───────────────────────────────
+let _lastPushedState = null;
+
+async function pushCloud(userId, s) {
+  if (!userId || !s) return;
+  const prev = _lastPushedState;
+
+  function diff(newArr, prevArr, toRowFn) {
+    const n = newArr  || [];
+    const p = prevArr || [];
+    const prevMap = new Map(p.map(r => [r.id, JSON.stringify(r)]));
+    const newMap  = new Map(n.map(r => [r.id, r]));
+    return {
+      toUpsert: n.filter(r => prevMap.get(r.id) !== JSON.stringify(r)).map(r => toRowFn(r, userId)),
+      toDelete: p.filter(r => !newMap.has(r.id)).map(r => r.id),
+    };
+  }
+
+  const collections = [
+    ["wm_accounts",              s.accounts,          prev?.accounts,          accountToRow],
+    ["wm_account_categories",    s.accountCategories, prev?.accountCategories, accountCategoryToRow],
+    ["wm_expense_categories",    s.expenseCategories, prev?.expenseCategories, expenseCategoryToRow],
+    ["wm_income_categories",     s.incomeCategories,  prev?.incomeCategories,  incomeCategoryToRow],
+    ["wm_transactions",          s.transactions,      prev?.transactions,      txToRow],
+    ["wm_investment_tx",         s.investmentTx,      prev?.investmentTx,      investmentTxToRow],
+    ["wm_fixed_deposits",        s.fixedDeposits,     prev?.fixedDeposits,     fdToRow],
+    ["wm_stocks",                s.stocks,            prev?.stocks,            stockToRow],
+    ["wm_corporate_actions",     s.corporateActions,  prev?.corporateActions,  corporateActionToRow],
+    ["wm_holdings",              s.holdings,          prev?.holdings,          holdingToRow],
+    ["wm_trade_balance_effects", s.tradeBalanceEffects, prev?.tradeBalanceEffects, balanceEffectToRow],
+  ];
+
+  const ops = [];
+  for (const [table, newArr, prevArr, toRowFn] of collections) {
+    const { toUpsert, toDelete } = diff(newArr, prevArr, toRowFn);
+    if (toUpsert.length > 0) { ops.push(dbUpsert(table, toUpsert)); }
+    if (toDelete.length > 0) { ops.push(dbDelete(table, userId, toDelete)); }
+    if (toUpsert.length + toDelete.length > 0) {
+      console.log(`[DB] ${table}: +${toUpsert.length} upserted, -${toDelete.length} deleted`);
+    }
+  }
+
+  // Market prices: upsert changed symbols
+  if (JSON.stringify(s.marketPrices) !== JSON.stringify(prev?.marketPrices)) {
+    const mpRows = Object.entries(s.marketPrices || {}).map(([symbol, v]) => ({
+      user_id: userId, symbol,
+      current_price: parseFloat(v.current_price) || 0,
+      last_updated:  v.last_updated || new Date().toISOString(),
+    }));
+    if (mpRows.length > 0) {
+      ops.push(supabase.from("wm_market_prices")
+        .upsert(mpRows, { onConflict: "user_id,symbol" })
+        .then(({ error }) => { if (error) console.error("[DB] upsert wm_market_prices:", error.message); }));
+    }
+  }
+
+  // FX rates: upsert all if changed
+  if (JSON.stringify(s.fxRates) !== JSON.stringify(prev?.fxRates)) {
+    const fxRows = Object.entries(s.fxRates || {}).map(([currency, rate]) => ({
+      user_id: userId, currency, rate: parseFloat(rate) || 1,
+    }));
+    if (fxRows.length > 0) {
+      ops.push(supabase.from("wm_fx_rates")
+        .upsert(fxRows, { onConflict: "user_id,currency" })
+        .then(({ error }) => { if (error) console.error("[DB] upsert wm_fx_rates:", error.message); }));
+    }
+  }
+
+  await Promise.all(ops);
+  _lastPushedState = s;
+}
+
+// ── One-time migration from legacy user_data JSON blob ────────────────────────
+async function migrateFromLegacyBlob(userId) {
+  try {
+    const { data, error } = await supabase.from("user_data")
+      .select("data").eq("id", userId).maybeSingle();
+    if (error || !data?.data) return null;
+    const clean = deduplicateState(sanitize(data.data));
+    const hasData = (clean.investmentTx?.length > 0) || (clean.transactions?.length > 0) || (clean.accounts?.length > 0);
+    if (!hasData) return null;
+    console.log("[Migration] Migrating from legacy blob:", clean.investmentTx?.length, "trades...");
+    await pushCloud(userId, clean);
+    console.log("[Migration] ✅ Done.");
+    return clean;
+  } catch(e) {
+    console.warn("[Migration] Failed:", e);
+    return null;
+  }
+}
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 const uid = () => "id_" + Math.random().toString(36).slice(2,10);
 
@@ -741,8 +1196,10 @@ function rebuildHoldings(investmentTx, existingHoldings) {
 
     if (!map[key]) {
       const existing = existingHoldings.find(h => h.id === tx.holdingId);
+      // Guarantee id is never null/undefined — DB has NOT NULL constraint on wm_holdings.id
+      const holdingId = tx.holdingId || existing?.id || ("h_" + sym + "_" + (tx.accountId || ""));
       map[key] = {
-        id:             tx.holdingId,
+        id:             holdingId,
         symbol:         tx.symbol   || existing?.symbol || "?",
         name:           tx.name     || existing?.name   || tx.symbol || "?",
         type:           tx.invType  || existing?.type   || "stock",
@@ -1277,6 +1734,7 @@ function reducer(rawState, action) {
             currency,
             date:        ca.date,
             accountId:   accId,
+            holdingId:   parentHolding.id || ("h_" + parentSym + "_" + accId),
             note:        `Demerger: ${parentSym} dissolved → ${(ca.result_stocks||[]).map(r=>r.symbol).join(", ")}`,
           });
         }
@@ -1300,6 +1758,7 @@ function reducer(rawState, action) {
             currency,
             date:         ca.date,
             accountId:    accId,
+            holdingId:    parentHolding.id || ("h_" + parentSym + "_" + accId),
             note:         `Demerger cost transfer: ${totalCostAllocatedPct}% of ${parentSym} cost → output stocks`,
           });
         }
@@ -1314,6 +1773,7 @@ function reducer(rawState, action) {
           const costAlloc  = eligCost * (costPct / 100);
           const avgPx      = costAlloc / newShares;
 
+          const outAccId = rs.accountId || accId;
           virtualTxs.push({
             id:           "dem_buy_" + ca.id + "_" + outSym,
             type:         "demerger_buy",     // treated as "buy" by rebuildHoldings
@@ -1325,7 +1785,8 @@ function reducer(rawState, action) {
             price:        avgPx,
             currency,
             date:         ca.date,
-            accountId:    rs.accountId || accId,
+            accountId:    outAccId,
+            holdingId:    "h_dem_" + ca.id + "_" + outSym + "_" + outAccId,
             note:         `Demerger: ${newShares} ${outSym} from ${eligQty} ${parentSym} (ratio ${rs.share_ratio}:1, ${costPct}% cost)`,
           });
 
@@ -6047,18 +6508,13 @@ export default function App() {
       try {
         const cloud = await pullCloud(user.id); // sanitized + deduped
         if (cloud) {
-          console.log("[Cloud] Loaded from cloud:", cloud.investmentTx?.length ?? 0, "trades");
+          console.log("[DB] Loaded from cloud:", cloud.investmentTx?.length ?? 0, "trades,",
+            cloud.corporateActions?.length ?? 0, "corporate actions");
+          // Seed the diff-tracker so first push only writes actual changes, not everything
+          _lastPushedState = cloud;
           dispatch({ type:"SET", payload:cloud });
-          // Push deduped state back if cloud had duplicates
-          const cloudRaw     = await supabase.from("user_data").select("data").eq("id", user.id).maybeSingle();
-          const rawTxCount   = cloudRaw?.data?.data?.investmentTx?.length ?? 0;
-          const cleanTxCount = cloud.investmentTx?.length ?? 0;
-          if (rawTxCount !== cleanTxCount) {
-            console.log(`[Cloud] Pushing deduped state back (${rawTxCount} → ${cleanTxCount} trades)`);
-            await pushCloud(user.id, cloud).catch(console.error);
-          }
         } else {
-          console.log("[Cloud] No cloud data found — starting fresh.");
+          console.log("[DB] No data found — starting fresh.");
         }
         setSyncStatus("synced");
       } catch(e) {
