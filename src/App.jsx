@@ -1,5 +1,5 @@
 // ============================================================
-// WEALTHMAP v31 — Accounts: show total per account type group
+// WEALTHMAP v32 — Accounts: category total inline in header row (no extra space)
 // Changes vs v16:
 //  1.  Cloud-primary: Supabase is the source of truth, not localStorage
 //  2.  On login: always pull from cloud first; localStorage is only offline cache
@@ -23,7 +23,7 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = "https://hqkqhgrfcwixqoehjfaj.supabase.co";
 const SUPABASE_KEY = "sb_publishable_N-ZcUkVL6fF-pch1sZPg6Q_hbd8sUPv";
 const supabase     = createClient(SUPABASE_URL, SUPABASE_KEY);
-const STORAGE_KEY  = "wealthmap_v31";
+const STORAGE_KEY  = "wealthmap_v32";
 
 // ─── CURRENCIES ───────────────────────────────────────────────────────────────
 const CURRENCIES = [
@@ -3512,16 +3512,23 @@ function AccountsView({ state, dispatch }) {
       )}
       {byCategory.map(cat=>cat.accounts.length>0&&(
         <div key={cat.id} style={{marginBottom:24}}>
-          {/* Category heading with Edit toggle */}
+          {/* Category heading — icon | name | total (fills empty space) | Edit */}
           <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
             <span style={{fontSize:18}}>{cat.icon}</span>
-            <span style={{fontWeight:700,color:"#475569",fontSize:14,textTransform:"uppercase",letterSpacing:"0.05em",flex:1}}>{cat.name}</span>
+            <span style={{fontWeight:700,color:"#475569",fontSize:14,textTransform:"uppercase",letterSpacing:"0.05em"}}>{cat.name}</span>
+            {/* Total fills the space between name and Edit button */}
+            <span style={{flex:1,textAlign:"right",fontSize:14,fontWeight:800,color:(()=>{
+              const t = cat.accounts.reduce((sum,acc)=>sum+toINR(calcBalance(acc.id,transactions,accounts,tradeBalanceEffects),acc.currency||"INR",fxRates),0);
+              return t>=0?"#0F172A":"#EF4444";
+            })()}}>
+              {fmtINR(cat.accounts.reduce((sum,acc)=>sum+toINR(calcBalance(acc.id,transactions,accounts,tradeBalanceEffects),acc.currency||"INR",fxRates),0))}
+            </span>
             {catEditMode[cat.id] ? (
               <button onClick={()=>setCatEditMode(p=>({...p,[cat.id]:false}))}
-                style={{fontSize:12,padding:"3px 10px",borderRadius:7,border:"1.5px solid #A7F3D0",background:"#F0FDF4",color:"#065F46",cursor:"pointer",fontFamily:"inherit",fontWeight:700}}>✓ Done</button>
+                style={{fontSize:12,padding:"3px 10px",borderRadius:7,border:"1.5px solid #A7F3D0",background:"#F0FDF4",color:"#065F46",cursor:"pointer",fontFamily:"inherit",fontWeight:700,whiteSpace:"nowrap"}}>✓ Done</button>
             ) : (
               <button onClick={()=>setCatEditMode(p=>({...p,[cat.id]:true}))}
-                style={{fontSize:12,padding:"3px 10px",borderRadius:7,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>✏️ Edit</button>
+                style={{fontSize:12,padding:"3px 10px",borderRadius:7,border:"1.5px solid #E2E8F0",background:"#F8FAFC",color:"#475569",cursor:"pointer",fontFamily:"inherit",fontWeight:600,whiteSpace:"nowrap"}}>✏️ Edit</button>
             )}
           </div>
           {/* Compact 2-col grid */}
@@ -3537,24 +3544,6 @@ function AccountsView({ state, dispatch }) {
               />
             ))}
           </div>
-          {/* Category total — sum of all account balances in this group */}
-          {cat.accounts.length > 1 && (() => {
-            const catTotal = cat.accounts.reduce((sum, acc) => {
-              const bal = calcBalance(acc.id, transactions, accounts, tradeBalanceEffects);
-              return sum + toINR(bal, acc.currency || "INR", fxRates);
-            }, 0);
-            return (
-              <div style={{display:"flex",justifyContent:"flex-end",alignItems:"center",gap:8,
-                marginTop:8,paddingTop:8,borderTop:"1.5px dashed #E2E8F0"}}>
-                <span style={{fontSize:12,color:"#94A3B8",fontWeight:600,textTransform:"uppercase",letterSpacing:"0.05em"}}>
-                  {cat.name} Total
-                </span>
-                <span style={{fontSize:15,fontWeight:800,color:catTotal>=0?"#0F172A":"#EF4444"}}>
-                  {fmtINR(catTotal)}
-                </span>
-              </div>
-            );
-          })()}
         </div>
       ))}
 
