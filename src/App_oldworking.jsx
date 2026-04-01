@@ -3332,7 +3332,7 @@ const toast = (msg, type="success") => window.__toast?.(msg, type);
 
 // ─── TINY COMPONENTS ─────────────────────────────────────────────────────────
 function Card({ children, style={} }) {
-  return <div style={{background:"#161616",borderRadius:16,padding:20,boxShadow:"0 2px 16px rgba(0,0,0,0.5)",border:"1px solid #2A2A2A",...style}}>{children}</div>;
+  return <div style={{background:"#161616",borderRadius:16,padding:20,boxShadow:"0 2px 16px rgba(0,0,0,0.5)",border:"1px solid #1F2937",...style}}>{children}</div>;
 }
 
 // Modal: renders as centered dialog on desktop, bottom sheet on mobile
@@ -3354,7 +3354,7 @@ function Modal({ title, onClose, children }) {
         background:"#161616", borderRadius:"20px 20px 0 0",
         width:"100%", maxWidth:560,
         maxHeight:"92dvh", overflowY:"auto",
-        boxShadow:"0 -8px 60px rgba(0,0,0,0.7)",border:"1px solid #2A2A2A",borderBottom:"none",
+        boxShadow:"0 -8px 60px rgba(0,0,0,0.7)",border:"1px solid #1F2937",borderBottom:"none",
         paddingBottom:"env(safe-area-inset-bottom,12px)",
       }}>
         {/* Drag handle */}
@@ -8775,7 +8775,7 @@ export default function App() {
       {showSidebar&&(
         <div style={{position:"fixed",inset:0,zIndex:300,display:"flex"}}>
           <div onClick={()=>setShowSidebar(false)} style={{position:"absolute",inset:0,background:"rgba(0,0,0,0.85)"}}/>
-          <div style={{position:"relative",width:280,background:"#161616",height:"100%",display:"flex",flexDirection:"column",boxShadow:"4px 0 32px rgba(0,0,0,0.6)",border:"1px solid #2A2A2A",zIndex:1}}>
+          <div style={{position:"relative",width:280,background:"#161616",height:"100%",display:"flex",flexDirection:"column",boxShadow:"4px 0 32px rgba(0,0,0,0.6)",border:"1px solid #1F2937",zIndex:1}}>
             {/* Sidebar header */}
             <div style={{background:"linear-gradient(135deg,#1A1400,#2A2000)",padding:"24px 20px 20px",display:"flex",alignItems:"center",gap:14}}>
               <div style={{width:44,height:44,borderRadius:"50%",background:"rgba(255,255,255,0.1)",border:"2px solid rgba(245,197,24,0.2)",display:"flex",alignItems:"center",justifyContent:"center",color:"#FFF8DC",fontWeight:800,fontSize:18}}>
@@ -8837,7 +8837,6 @@ export default function App() {
       {/* ── Global styles ── */}
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');
-        html, body { margin:0; padding:0; background:#111111; }
         *, *::before, *::after { -webkit-tap-highlight-color:transparent; box-sizing:border-box; }
         ::-webkit-scrollbar { width:5px; height:5px; }
         ::-webkit-scrollbar-track { background:#F1F5F9; }
